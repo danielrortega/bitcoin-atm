@@ -21,18 +21,14 @@ Um caixa eletrônico de Bitcoin (ATM) para troca de reais (BRL) por BTC, com sup
 3. Configure o ambiente (veja docs/implementation.md).
 
 ## Uso
-bash
+   ```bash
+   python src/main.py\
 
-python src/main.py
-
-##Licença
-MIT
-
-#### `LICENSE`
+## `LICENSE`
 ```text
 MIT License
 
-Copyright (c) 2023 Seu Nome
+Copyright (c) 2023 Daniel R. Ortega
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
