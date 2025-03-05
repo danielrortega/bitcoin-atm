@@ -11,7 +11,7 @@ Um caixa eletrônico de Bitcoin (ATM) para troca de reais (BRL) por BTC, com sup
 ## Instalação
 1. Clone o repositório:
    ```bash
-   git clone https://github.com/seu-usuario/bitcoin-atm.git
+   git clone https://github.com/danielrortega/bitcoin-atm.git
    cd bitcoin-atm
 2. Instale as dependências:
 
