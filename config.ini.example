@@ -1,0 +1,15 @@
+[btcpay]
+host = https://your.btcpay.server
+store_id = your_store_id
+api_token = encrypted_api_token_here
+currency = BRL
+wallet_id = your_wallet_id
+lightning_wallet_id = your_lightning_wallet_id
+
+[hardware]
+serial_port = /dev/ttyUSB0
+baud_rate = 9600
+printer_usb = usb_printer_id
+
+[telegram]
+chat_id = your_telegram_chat_id
