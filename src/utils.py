@@ -21,5 +21,5 @@ def is_online():
     try:
         requests.get("https://google.com", timeout=5)
         return True
-    except requests.ConnectionError:
+    except requests.RequestException:
         return False

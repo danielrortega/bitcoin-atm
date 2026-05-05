@@ -1,4 +1,7 @@
-from PyQt5.QtWidgets import QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QMessageBox
+import time
+
+from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
+                              QHBoxLayout, QWidget, QMessageBox, QLineEdit)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QFont
 from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment, 
@@ -56,6 +59,13 @@ class BTMWindow(QMainWindow):
         self.lightning_button.clicked.connect(lambda: self.select_payment("lightning"))
         self.button_layout.addWidget(self.lightning_button)
         self.layout.addLayout(self.button_layout)
+
+        self.address_input = QLineEdit(self)
+        self.address_input.setFont(QFont("Arial", 14))
+        self.address_input.setPlaceholderText("Escaneie o QR code ou digite o endereço...")
+        self.address_input.setVisible(False)
+        self.address_input.textChanged.connect(self._on_address_changed)
+        self.layout.addWidget(self.address_input)
 
         self.confirm_button = QPushButton("Confirmar", self)
         self.confirm_button.setFont(QFont("Arial", 16))
@@ -123,31 +133,47 @@ class BTMWindow(QMainWindow):
         elif self.destination:
             self.check_qr_input()
 
+    def _on_address_changed(self, text):
+        self.destination = text.strip() if text.strip() else None
+        self.check_qr_input()
+
     def select_payment(self, payment_type):
         self.payment_type = payment_type
         self.instruction_label.setText("Escaneie o QR code da sua carteira")
         self.status_label.setText("Aguardando QR code...")
         self.onchain_button.setEnabled(False)
         self.lightning_button.setEnabled(False)
-        self.confirm_button.setEnabled(True)
+        self.address_input.setVisible(True)
+        self.address_input.setFocus()
+        self.confirm_button.setEnabled(False)
 
     def check_qr_input(self):
-        if self.destination and ((self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination)) or 
-                                 (self.payment_type == "lightning" and is_valid_lightning_invoice(self.destination))):
+        if not self.destination:
+            self.confirm_button.setEnabled(False)
+            return
+        valid = (
+            (self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination))
+            or (self.payment_type == "lightning" and is_valid_lightning_invoice(self.destination))
+        )
+        if valid:
             self.status_label.setText(f"Endereço detectado: {self.destination[:10]}...")
             self.status_label.setStyleSheet("color: green;")
-        elif self.destination:
+            self.confirm_button.setEnabled(True)
+        else:
             self.status_label.setText("Endereço inválido!")
             self.status_label.setStyleSheet("color: red;")
-            self.reset()
+            self.confirm_button.setEnabled(False)
 
     def confirm_payment(self):
         try:
-            if time.time() - self.start_time > 30:
+            if not self.destination:
+                QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
+                return
+            if self.start_time and time.time() - self.start_time > 30:
                 self.update_rate()
                 self.start_time = time.time()
             if not self.operated_rate:
-                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, self.operated_rate or get_btc_rate())
+                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, get_btc_rate())
                 QMessageBox.information(self, "Modo Offline", "Transação enfileirada para processamento quando online.")
                 self.reset()
                 return
@@ -180,4 +206,6 @@ class BTMWindow(QMainWindow):
         self.status_label.setStyleSheet("color: black;")
         self.onchain_button.setEnabled(False)
         self.lightning_button.setEnabled(False)
+        self.address_input.clear()
+        self.address_input.setVisible(False)
         self.confirm_button.setEnabled(False)
