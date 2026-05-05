@@ -1,9 +1,9 @@
-PyQt5==5.15.7
+PyQt5==5.15.11
 cryptography==44.0.1
 pyserial==3.5
 requests==2.32.4
-qrcode==7.4.2
-pillow==10.3.0
-escpos==0.0.15
-telegram-send==0.25
+qrcode==8.0
+pillow==11.2.1
+escpos==3.1
+telegram-send==0.34.0
 pysocks==1.7.1
