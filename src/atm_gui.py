@@ -103,6 +103,8 @@ class BTMWindow(QMainWindow):
             if self.amount_brl and not self.destination:
                 self.status_label.setText(f"Nota detectada: R${self.amount_brl} - Cotação atualizada")
         else:
+            # Stale rate must not be used to settle a payment.
+            self.operated_rate = None
             self.rate_label.setText("Cotação indisponível (offline)")
 
     def update_rate_timer(self):
@@ -193,7 +195,13 @@ class BTMWindow(QMainWindow):
         except Exception as e:
             self.status_label.setText("Erro na transação!")
             self.status_label.setStyleSheet("color: red;")
-            QMessageBox.critical(self, "Erro", f"Falha na transação: {str(e)}")
+            try:
+                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, self.operated_rate)
+                QMessageBox.warning(self, "Falha no envio",
+                    f"Falha: {e}\n\nA transação foi enfileirada e será processada automaticamente.")
+            except Exception as enqueue_err:
+                QMessageBox.critical(self, "Erro",
+                    f"Falha na transação: {e}\n\nE também falhou ao enfileirar: {enqueue_err}")
             self.reset()
 
     def reset(self):

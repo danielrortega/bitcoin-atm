@@ -10,11 +10,13 @@ import telegram_send
 from cryptography.fernet import Fernet
 from escpos.printer import Usb
 
-logging.basicConfig(
-    filename='/var/log/btc_atm.log',
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-)
+_LOG_PATH = '/var/log/btc_atm.log'
+_LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
+try:
+    logging.basicConfig(filename=_LOG_PATH, level=logging.INFO, format=_LOG_FORMAT)
+except (PermissionError, FileNotFoundError, OSError):
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+    logging.warning("Could not write to %s; logging to stderr instead.", _LOG_PATH)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
 _QUEUE_PATH = '/var/atm/offline_queue.json'
