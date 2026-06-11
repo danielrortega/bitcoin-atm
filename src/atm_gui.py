@@ -4,8 +4,9 @@ from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QWidget, QMessageBox, QLineEdit)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QFont
-from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment, 
-                      send_lightning_payment, print_receipt, enqueue_transaction)
+from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment,
+                      send_lightning_payment, print_receipt, enqueue_transaction,
+                      brl_to_btc, PaymentNotBroadcast)
 from utils import is_valid_bitcoin_address, is_valid_lightning_invoice
 
 class BTMWindow(QMainWindow):
@@ -95,15 +96,19 @@ class BTMWindow(QMainWindow):
         self.update_rate()
 
     def update_rate(self):
+        # Reinicia a janela de 30s em qualquer caso. Se isto só fosse feito
+        # no sucesso, ao perder conexão o update_rate_timer veria
+        # remaining<=0 a cada tick (100ms) e chamaria get_btc_rate()
+        # (bloqueante, até 10s) ~10x/s, congelando a interface.
+        self.rate_start_time = time.time()
         rate = get_btc_rate()
         if rate:
             self.operated_rate = rate
             self.rate_label.setText(f"Cotação BTC/BRL: R$ {self.operated_rate:,.2f}")
-            self.rate_start_time = time.time()
             if self.amount_brl and not self.destination:
                 self.status_label.setText(f"Nota detectada: R${self.amount_brl} - Cotação atualizada")
         else:
-            # Stale rate must not be used to settle a payment.
+            # Cotação obsoleta não pode ser usada para liquidar um pagamento.
             self.operated_rate = None
             self.rate_label.setText("Cotação indisponível (offline)")
 
@@ -119,9 +124,12 @@ class BTMWindow(QMainWindow):
 
     def check_note(self):
         if self.note_reader.in_waiting > 0:
+            # Sempre drena o buffer serial para não acumular, mas só aceita
+            # uma nova nota enquanto o cliente ainda está escolhendo o método.
+            # Pulsos espúrios durante o pagamento em andamento são ignorados.
             data = self.note_reader.read(self.note_reader.in_waiting)
             note_value = int.from_bytes(data, "big") if data else None
-            if note_value:
+            if note_value and self.payment_type is None and self.destination is None:
                 self.amount_brl = note_value
                 self.start_time = time.time()
                 self.status_label.setText(f"Nota detectada: R${note_value}")
@@ -167,41 +175,73 @@ class BTMWindow(QMainWindow):
             self.confirm_button.setEnabled(False)
 
     def confirm_payment(self):
+        if not self.destination:
+            QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
+            return
+
+        # Revalida a cotação se a janela de 30s expirou.
+        if self.start_time and time.time() - self.start_time > 30:
+            self.update_rate()
+            self.start_time = time.time()
+
+        # Sem cotação (offline) → enfileira para liquidar quando online.
+        if not self.operated_rate:
+            try:
+                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, None)
+                QMessageBox.information(self, "Modo Offline",
+                    "Sem cotação no momento. Transação enfileirada para "
+                    "processamento quando online.")
+            except Exception as e:
+                QMessageBox.critical(self, "Erro", f"Falha ao enfileirar: {e}")
+            self.reset()
+            return
+
+        # Valida o destino antes de qualquer envio.
+        if self.payment_type == "onchain":
+            valid = is_valid_bitcoin_address(self.destination)
+        else:
+            valid = is_valid_lightning_invoice(self.destination)
+        if not valid:
+            QMessageBox.warning(self, "Endereço inválido",
+                "Endereço/invoice inválido para o método escolhido.")
+            self.reset()
+            return
+
+        # Tenta enviar.
         try:
-            if not self.destination:
-                QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
-                return
-            if self.start_time and time.time() - self.start_time > 30:
-                self.update_rate()
-                self.start_time = time.time()
-            if not self.operated_rate:
-                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, get_btc_rate())
-                QMessageBox.information(self, "Modo Offline", "Transação enfileirada para processamento quando online.")
-                self.reset()
-                return
             if self.payment_type == "onchain":
-                if not is_valid_bitcoin_address(self.destination):
-                    raise Exception("Endereço on-chain inválido!")
                 txid = send_onchain_payment(self.amount_brl, self.destination, self.operated_rate)
             else:
-                if not is_valid_lightning_invoice(self.destination):
-                    raise Exception("Invoice Lightning inválido!")
                 txid = send_lightning_payment(self.amount_brl, self.destination, self.operated_rate)
-            amount_btc = self.amount_brl / self.operated_rate
-            self.status_label.setText(f"Bitcoin enviado! TxID: {txid[:10]}...")
+            amount_btc = brl_to_btc(self.amount_brl, self.operated_rate)
+            self.status_label.setText(f"Bitcoin enviado! TxID: {str(txid)[:10]}...")
             self.instruction_label.setText("Transação concluída. Insira outra nota.")
             print_receipt(self.amount_brl, amount_btc, self.destination, txid)
             self.reset()
-        except Exception as e:
-            self.status_label.setText("Erro na transação!")
-            self.status_label.setStyleSheet("color: red;")
+        except PaymentNotBroadcast as e:
+            # Com certeza NÃO foi enviado → seguro enfileirar.
+            self.status_label.setText("Sem conexão — transação enfileirada")
+            self.status_label.setStyleSheet("color: #e67e22;")
             try:
                 enqueue_transaction(self.amount_brl, self.destination, self.payment_type, self.operated_rate)
-                QMessageBox.warning(self, "Falha no envio",
-                    f"Falha: {e}\n\nA transação foi enfileirada e será processada automaticamente.")
-            except Exception as enqueue_err:
+                QMessageBox.information(self, "Enfileirada",
+                    f"Não foi possível enviar agora ({e}).\n\n"
+                    "A transação foi enfileirada e será processada automaticamente.")
+            except Exception as enq:
                 QMessageBox.critical(self, "Erro",
-                    f"Falha na transação: {e}\n\nE também falhou ao enfileirar: {enqueue_err}")
+                    f"Falha ao enviar e ao enfileirar: {e}\n{enq}")
+            self.reset()
+        except Exception as e:
+            # Resultado AMBÍGUO (timeout/5xx) ou erro inesperado. O Bitcoin
+            # pode já ter sido enviado: NÃO reenfileira, para evitar gasto
+            # duplo. Operador precisa conferir manualmente.
+            self.status_label.setText("Falha incerta — verifique a carteira!")
+            self.status_label.setStyleSheet("color: red;")
+            QMessageBox.critical(self, "Verificação necessária",
+                f"Falha incerta: {e}\n\n"
+                "O Bitcoin PODE já ter sido enviado. Verifique a carteira no "
+                "BTCPay Server antes de reenviar. Nada foi enfileirado "
+                "automaticamente para evitar gasto duplo.")
             self.reset()
 
     def reset(self):

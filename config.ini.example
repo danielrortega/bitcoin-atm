@@ -3,12 +3,23 @@ host = https://your.btcpay.server
 store_id = your_store_id
 api_token = encrypted_api_token_here
 currency = BRL
-wallet_id = your_wallet_id
-lightning_wallet_id = your_lightning_wallet_id
+; Código da cripto usada no BTCPay (normalmente BTC). Usado nos endpoints
+; on-chain e Lightning. Para testnet o cryptoCode continua sendo BTC.
+crypto_code = BTC
+; (Opcional) Sobrescreve o paymentMethodId on-chain. Padrão: <crypto_code>-CHAIN
+; (ex.: BTC-CHAIN). Use 'onchain' apenas em instâncias BTCPay muito antigas.
+; onchain_payment_method = BTC-CHAIN
+; --- Legado: não são mais usados pelos endpoints atuais do Greenfield ---
+; wallet_id = your_wallet_id
+; lightning_wallet_id = your_lightning_wallet_id
 
 [hardware]
+; Porta serial do noteiro. Na POC (sem noteiro), use a porta virtual do socat,
+; ex.: /tmp/ttyV1
 serial_port = /dev/ttyUSB0
 baud_rate = 9600
+; ID USB da impressora ESC/POS no formato vendor:product (veja `lsusb`),
+; ex.: 0416:5011
 printer_usb = usb_printer_id
 
 [telegram]
