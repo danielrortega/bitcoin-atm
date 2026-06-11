@@ -1,6 +1,14 @@
+import configparser
+import os
+
 import qrcode
 import requests
 from PIL import Image
+
+from btc_address import validate_bitcoin_address, validate_lightning_invoice
+
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
+
 
 def generate_qr_code(data):
     qr = qrcode.QRCode(version=1, box_size=6, border=1)
@@ -11,28 +19,37 @@ def generate_qr_code(data):
     img.save("/tmp/qr.png")
     return "/tmp/qr.png"
 
+
 def is_valid_bitcoin_address(address):
-    # Aceita mainnet (1/3/bc1) e também testnet, signet e regtest
-    # (m/n/2/tb1/bcrt1), necessários para a POC em testnet.
-    # NOTA: validação por prefixo + tamanho apenas. NÃO valida o checksum
-    # base58/bech32 — para produção use uma biblioteca como `bech32`/
-    # `bitcoinlib` para evitar envio a endereços digitados incorretamente.
-    if not isinstance(address, str):
-        return False
-    addr = address.strip()
-    prefixes = ('bc1', 'tb1', 'bcrt1', '1', '3', '2', 'm', 'n')
-    return addr.startswith(prefixes) and 14 <= len(addr) <= 100
+    # Validação completa com checksum (Base58Check / Bech32 / Bech32m).
+    return validate_bitcoin_address(address)
+
 
 def is_valid_lightning_invoice(invoice):
-    # Aceita mainnet (lnbc), testnet (lntb), signet (lntbs) e regtest (lnbcrt).
-    if not isinstance(invoice, str):
-        return False
-    inv = invoice.strip().lower()
-    return inv.startswith(('lnbc', 'lntb', 'lnbcrt')) and len(inv) >= 20
+    # Validação do checksum bech32 da invoice BOLT11.
+    return validate_lightning_invoice(invoice)
 
-def is_online():
+
+def _btcpay_host():
     try:
-        requests.get("https://google.com", timeout=5)
+        cfg = configparser.ConfigParser()
+        cfg.read(_CONFIG_PATH)
+        return cfg['btcpay']['host'].rstrip('/')
+    except Exception:
+        return None
+
+
+def is_online(timeout=5):
+    """Verifica a conectividade tentando alcançar o host do BTCPay configurado.
+    É mais relevante que um ping genérico (o que importa é se o BTCPay está
+    acessível) e evita vazar tráfego a terceiros (ex.: google.com) num
+    cenário com Tor. Qualquer resposta HTTP conta como online; só erros de
+    conexão/timeout contam como offline. Sem host configurado, retorna False."""
+    host = _btcpay_host()
+    if not host:
+        return False
+    try:
+        requests.head(host, timeout=timeout, allow_redirects=True)
         return True
     except requests.RequestException:
         return False
