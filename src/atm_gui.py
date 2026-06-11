@@ -2,12 +2,64 @@ import time
 
 from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QWidget, QMessageBox, QLineEdit)
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QThreadPool, QRunnable, QObject, pyqtSignal
 from PyQt5.QtGui import QFont
 from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment,
                       send_lightning_payment, print_receipt, enqueue_transaction,
                       brl_to_btc, PaymentNotBroadcast)
 from utils import is_valid_bitcoin_address, is_valid_lightning_invoice
+
+
+# --------------------------------------------------------------------------
+# Infra de threading: roda funções bloqueantes (rede/USB) fora da thread de
+# eventos da GUI, evitando que a interface congele durante chamadas ao
+# BTCPay Server (cotação ~10s, pagamento ~30s) ou à impressora.
+# --------------------------------------------------------------------------
+class _WorkerSignals(QObject):
+    result = pyqtSignal(object)
+    error = pyqtSignal(object)
+    finished = pyqtSignal()
+
+
+class _Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = _WorkerSignals()
+
+    def run(self):
+        try:
+            res = self.fn(*self.args, **self.kwargs)
+        except Exception as e:
+            # Preserva o erro original; o handler na GUI decide o que fazer.
+            self.signals.error.emit(e)
+        else:
+            self.signals.result.emit(res)
+        finally:
+            self.signals.finished.emit()
+
+
+def _execute_payment(amount_brl, destination, payment_type, rate, rate_stale):
+    """Executado na thread de trabalho. Faz (se necessário) a cotação fresca,
+    o envio e a impressão do recibo — tudo o que bloqueia. Levanta
+    PaymentNotBroadcast/PaymentUncertain conforme atm_core para o handler
+    classificar com segurança."""
+    if rate_stale:
+        # Não liquida com cotação > 30s: busca uma fresca. Se falhar,
+        # PaymentNotBroadcast faz a transação ser enfileirada com segurança.
+        rate = get_btc_rate()
+    if not rate:
+        raise PaymentNotBroadcast("sem cotação fresca para liquidar")
+    if payment_type == "onchain":
+        txid = send_onchain_payment(amount_brl, destination, rate)
+    else:
+        txid = send_lightning_payment(amount_brl, destination, rate)
+    amount_btc = brl_to_btc(amount_brl, rate)
+    print_receipt(amount_brl, amount_btc, destination, txid)
+    return txid
+
 
 class BTMWindow(QMainWindow):
     def __init__(self):
@@ -15,7 +67,7 @@ class BTMWindow(QMainWindow):
         self.setWindowTitle("Bitcoin ATM")
         self.setGeometry(0, 0, 800, 480)
         self.setStyleSheet("background-color: #f0f0f0;")
-        
+
         # Configuração do layout
         self.central_widget = QWidget(self)
         self.setCentralWidget(self.central_widget)
@@ -84,6 +136,13 @@ class BTMWindow(QMainWindow):
         self.destination = None
         self.payment_type = None
 
+        # Threading
+        self.threadpool = QThreadPool()
+        self._workers = set()          # mantém referência até finished
+        self._rate_in_flight = False
+        self._payment_in_flight = False
+        self._pending = None           # contexto da transação em voo
+
         # Timers
         self.rate_timer = QTimer(self)
         self.rate_timer.timeout.connect(self.update_rate_timer)
@@ -95,22 +154,48 @@ class BTMWindow(QMainWindow):
 
         self.update_rate()
 
+    # ----------------------------------------------------------------------
+    # Helper de execução assíncrona
+    # ----------------------------------------------------------------------
+    def _run_async(self, fn, on_result, on_error, *args):
+        worker = _Worker(fn, *args)
+        worker.setAutoDelete(False)
+        self._workers.add(worker)
+        worker.signals.result.connect(on_result)
+        worker.signals.error.connect(on_error)
+        # Descarta a referência só depois que result/error já foram tratados
+        # (finished é emitido por último), evitando uso após coleta de lixo.
+        worker.signals.finished.connect(lambda: self._workers.discard(worker))
+        self.threadpool.start(worker)
+
+    # ----------------------------------------------------------------------
+    # Cotação (assíncrona)
+    # ----------------------------------------------------------------------
     def update_rate(self):
-        # Reinicia a janela de 30s em qualquer caso. Se isto só fosse feito
-        # no sucesso, ao perder conexão o update_rate_timer veria
-        # remaining<=0 a cada tick (100ms) e chamaria get_btc_rate()
-        # (bloqueante, até 10s) ~10x/s, congelando a interface.
+        if self._rate_in_flight:
+            return
+        self._rate_in_flight = True
+        # Reinicia a janela de 30s já no disparo. Junto com o guard acima,
+        # evita o loop que, offline, chamava get_btc_rate() ~10x/s.
         self.rate_start_time = time.time()
-        rate = get_btc_rate()
+        self._run_async(get_btc_rate, self._on_rate_result, self._on_rate_error)
+
+    def _on_rate_result(self, rate):
+        self._rate_in_flight = False
         if rate:
             self.operated_rate = rate
-            self.rate_label.setText(f"Cotação BTC/BRL: R$ {self.operated_rate:,.2f}")
-            if self.amount_brl and not self.destination:
+            self.rate_label.setText(f"Cotação BTC/BRL: R$ {rate:,.2f}")
+            if self.amount_brl and not self.destination and not self._payment_in_flight:
                 self.status_label.setText(f"Nota detectada: R${self.amount_brl} - Cotação atualizada")
         else:
             # Cotação obsoleta não pode ser usada para liquidar um pagamento.
             self.operated_rate = None
             self.rate_label.setText("Cotação indisponível (offline)")
+
+    def _on_rate_error(self, exc):
+        self._rate_in_flight = False
+        self.operated_rate = None
+        self.rate_label.setText("Cotação indisponível (offline)")
 
     def update_rate_timer(self):
         if not self.rate_start_time:
@@ -122,7 +207,12 @@ class BTMWindow(QMainWindow):
             remaining = 30
         self.timer_label.setText(f"Cotação atualiza em: {remaining:.1f}s")
 
+    # ----------------------------------------------------------------------
+    # Leitura de notas
+    # ----------------------------------------------------------------------
     def check_note(self):
+        if self._payment_in_flight:
+            return
         if self.note_reader.in_waiting > 0:
             # Sempre drena o buffer serial para não acumular, mas só aceita
             # uma nova nota enquanto o cliente ainda está escolhendo o método.
@@ -144,6 +234,8 @@ class BTMWindow(QMainWindow):
             self.check_qr_input()
 
     def _on_address_changed(self, text):
+        if self._payment_in_flight:
+            return
         self.destination = text.strip() if text.strip() else None
         self.check_qr_input()
 
@@ -158,6 +250,8 @@ class BTMWindow(QMainWindow):
         self.confirm_button.setEnabled(False)
 
     def check_qr_input(self):
+        if self._payment_in_flight:
+            return
         if not self.destination:
             self.confirm_button.setEnabled(False)
             return
@@ -174,29 +268,16 @@ class BTMWindow(QMainWindow):
             self.status_label.setStyleSheet("color: red;")
             self.confirm_button.setEnabled(False)
 
+    # ----------------------------------------------------------------------
+    # Pagamento (assíncrono)
+    # ----------------------------------------------------------------------
     def confirm_payment(self):
-        if not self.destination:
-            QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
+        if self._payment_in_flight or not self.destination:
+            if not self.destination:
+                QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
             return
 
-        # Revalida a cotação se a janela de 30s expirou.
-        if self.start_time and time.time() - self.start_time > 30:
-            self.update_rate()
-            self.start_time = time.time()
-
-        # Sem cotação (offline) → enfileira para liquidar quando online.
-        if not self.operated_rate:
-            try:
-                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, None)
-                QMessageBox.information(self, "Modo Offline",
-                    "Sem cotação no momento. Transação enfileirada para "
-                    "processamento quando online.")
-            except Exception as e:
-                QMessageBox.critical(self, "Erro", f"Falha ao enfileirar: {e}")
-            self.reset()
-            return
-
-        # Valida o destino antes de qualquer envio.
+        # Valida o destino (checksum) antes de qualquer envio. Rápido, na GUI.
         if self.payment_type == "onchain":
             valid = is_valid_bitcoin_address(self.destination)
         else:
@@ -207,53 +288,82 @@ class BTMWindow(QMainWindow):
             self.reset()
             return
 
-        # Tenta enviar.
-        try:
-            if self.payment_type == "onchain":
-                txid = send_onchain_payment(self.amount_brl, self.destination, self.operated_rate)
-            else:
-                txid = send_lightning_payment(self.amount_brl, self.destination, self.operated_rate)
-            amount_btc = brl_to_btc(self.amount_brl, self.operated_rate)
-            self.status_label.setText(f"Bitcoin enviado! TxID: {str(txid)[:10]}...")
-            self.instruction_label.setText("Transação concluída. Insira outra nota.")
-            print_receipt(self.amount_brl, amount_btc, self.destination, txid)
-            self.reset()
-        except PaymentNotBroadcast as e:
+        # Cotação obsoleta (>30s) ou inexistente força uma busca fresca dentro
+        # da thread de trabalho antes de liquidar.
+        rate_stale = (not self.rate_start_time) or (time.time() - self.rate_start_time > 30)
+        needs_fresh = rate_stale or not self.operated_rate
+
+        # Dispara o envio na thread de trabalho; a GUI continua responsiva.
+        # Sem cotação disponível, _execute_payment levanta PaymentNotBroadcast
+        # e a transação é enfileirada com segurança pelo handler de erro.
+        self._payment_in_flight = True
+        self._pending = (self.amount_brl, self.destination, self.payment_type)
+        self._set_busy()
+        self._run_async(_execute_payment, self._on_payment_result, self._on_payment_error,
+                        self.amount_brl, self.destination, self.payment_type,
+                        self.operated_rate, needs_fresh)
+
+    def _set_busy(self):
+        self.status_label.setText("Processando pagamento...")
+        self.status_label.setStyleSheet("color: #2196F3;")
+        self.onchain_button.setEnabled(False)
+        self.lightning_button.setEnabled(False)
+        self.confirm_button.setEnabled(False)
+        self.address_input.setEnabled(False)
+
+    def _on_payment_result(self, txid):
+        self._payment_in_flight = False
+        # reset() primeiro (restaura o estado ocioso) e a mensagem de
+        # resultado depois, para que ela persista até a próxima nota.
+        self.reset()
+        self.status_label.setText(f"Bitcoin enviado! TxID: {str(txid)[:10]}...")
+        self.status_label.setStyleSheet("color: green;")
+        self.instruction_label.setText("Transação concluída. Insira outra nota.")
+
+    def _on_payment_error(self, exc):
+        self._payment_in_flight = False
+        amount_brl, destination, payment_type = self._pending or (self.amount_brl, self.destination, self.payment_type)
+        self.reset()
+        if isinstance(exc, PaymentNotBroadcast):
             # Com certeza NÃO foi enviado → seguro enfileirar.
-            self.status_label.setText("Sem conexão — transação enfileirada")
-            self.status_label.setStyleSheet("color: #e67e22;")
             try:
-                enqueue_transaction(self.amount_brl, self.destination, self.payment_type, self.operated_rate)
+                enqueue_transaction(amount_brl, destination, payment_type, self.operated_rate)
+                self.status_label.setText("Sem conexão — transação enfileirada")
+                self.status_label.setStyleSheet("color: #e67e22;")
                 QMessageBox.information(self, "Enfileirada",
-                    f"Não foi possível enviar agora ({e}).\n\n"
+                    f"Não foi possível enviar agora ({exc}).\n\n"
                     "A transação foi enfileirada e será processada automaticamente.")
             except Exception as enq:
+                self.status_label.setText("Erro ao enfileirar!")
+                self.status_label.setStyleSheet("color: red;")
                 QMessageBox.critical(self, "Erro",
-                    f"Falha ao enviar e ao enfileirar: {e}\n{enq}")
-            self.reset()
-        except Exception as e:
+                    f"Falha ao enviar e ao enfileirar: {exc}\n{enq}")
+        else:
             # Resultado AMBÍGUO (timeout/5xx) ou erro inesperado. O Bitcoin
             # pode já ter sido enviado: NÃO reenfileira, para evitar gasto
             # duplo. Operador precisa conferir manualmente.
             self.status_label.setText("Falha incerta — verifique a carteira!")
             self.status_label.setStyleSheet("color: red;")
             QMessageBox.critical(self, "Verificação necessária",
-                f"Falha incerta: {e}\n\n"
+                f"Falha incerta: {exc}\n\n"
                 "O Bitcoin PODE já ter sido enviado. Verifique a carteira no "
                 "BTCPay Server antes de reenviar. Nada foi enfileirado "
                 "automaticamente para evitar gasto duplo.")
-            self.reset()
 
     def reset(self):
+        # Restaura o estado ocioso. Handlers de resultado podem sobrescrever
+        # instruction/status DEPOIS de chamar reset() para exibir o desfecho.
         self.amount_brl = None
         self.start_time = None
         self.destination = None
         self.payment_type = None
+        self._pending = None
         self.instruction_label.setText("Insira uma nota no noteiro")
         self.status_label.setText("Aguardando...")
         self.status_label.setStyleSheet("color: black;")
         self.onchain_button.setEnabled(False)
         self.lightning_button.setEnabled(False)
+        self.address_input.setEnabled(True)
         self.address_input.clear()
         self.address_input.setVisible(False)
         self.confirm_button.setEnabled(False)
