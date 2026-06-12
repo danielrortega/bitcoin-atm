@@ -66,8 +66,8 @@ Se a internet cair durante o processo, a transação é salva em fila e processa
 
 | Item | Descrição |
 |---|---|
-| Linux Ubuntu 20.04+ | Sistema operacional (AMD64 recomendado) |
-| Python 3.8 ou superior | Já vem instalado na maioria das distribuições Linux |
+| Linux Ubuntu 22.04+ | Sistema operacional (AMD64 recomendado) |
+| Python 3.9 ou superior | Já vem instalado na maioria das distribuições Linux |
 | BTCPay Server | Seu próprio servidor de pagamentos Bitcoin. [Saiba mais](https://btcpayserver.org) |
 | Bot no Telegram (opcional) | Para receber alertas de transações no celular |
 
@@ -151,9 +151,9 @@ Você precisará de algumas informações do seu BTCPay Server. Acesse o painel 
 |---|---|
 | URL do servidor | Endereço do seu servidor, ex.: `https://pay.minhaempresa.com` |
 | Store ID | `Configurações da Loja → Geral → ID da Loja` |
-| Wallet ID | `Carteiras → On-chain → Configurações → ID` (geralmente `BTC`) |
-| Lightning Wallet ID | `Carteiras → Lightning → Configurações → ID` (geralmente `BTC`) |
-| API Token | `Configurações da Conta → Chaves de API → Criar nova chave` (permissões: leitura de taxa, criação de transação, pagamento Lightning) |
+| API Token | `Configurações da Conta → Chaves de API → Criar nova chave` (permissões necessárias: leitura de taxa, criação de transação on-chain, pagamento Lightning) |
+
+> **Nota:** os campos `wallet_id` e `lightning_wallet_id` existentes em versões antigas foram removidos. O ATM usa a API Greenfield atual (`/payment-methods/BTC-CHAIN/...` e `/lightning/BTC/...`), configurada pelo campo `crypto_code` no `config.ini`.
 
 Com o API Token em mãos, criptografe-o para usar no config:
 
@@ -200,11 +200,8 @@ api_token = gAAAAAB...
 # Moeda fiduciária (deixe BRL para o Brasil)
 currency = BRL
 
-# ID da carteira on-chain (normalmente "BTC")
-wallet_id = BTC
-
-# ID da carteira Lightning (normalmente "BTC")
-lightning_wallet_id = BTC
+# Código da cripto no BTCPay (normalmente BTC, mesmo em testnet)
+crypto_code = BTC
 
 [hardware]
 # Porta serial do noteiro BV20
@@ -213,9 +210,8 @@ serial_port = /dev/ttyUSB0
 # Taxa de comunicação serial do noteiro (verifique o manual do BV20)
 baud_rate = 9600
 
-# ID USB da impressora no formato vendor_id:product_id
-# Para descobrir, conecte a impressora e execute: lsusb
-printer_usb = 0x0416:0x5011
+# ID USB da impressora no formato vendor:product (veja `lsusb`)
+printer_usb = 0416:5011
 
 [telegram]
 # ID do chat para receber alertas (obtido com o @userinfobot no Telegram)
@@ -332,7 +328,63 @@ bitcoin-atm/
     ├── main.py           # Ponto de entrada da aplicação
     ├── atm_gui.py        # Interface gráfica (PyQt5)
     ├── atm_core.py       # Lógica de negócio (BTCPay, impressora, fila)
+    ├── btc_address.py    # Validação de endereços/invoices com checksum
     └── utils.py          # Funções auxiliares (validação, QR, rede)
+```
+
+---
+
+## POC sem hardware (Testnet)
+
+É possível testar o ATM completo sem noteiro físico, usando a **testnet do Bitcoin** e uma **porta serial virtual**.
+
+### 1. Simular o noteiro com `socat`
+
+Instale o `socat` e crie um par de portas seriais virtuais:
+
+```bash
+sudo apt-get install -y socat
+socat -d -d pty,raw,echo=0,link=/tmp/ttyV0 pty,raw,echo=0,link=/tmp/ttyV1 &
+```
+
+No `config.ini`, use `/tmp/ttyV1` como `serial_port`. Para simular a inserção de uma cédula de R$ 50 (valor em 2 bytes big-endian):
+
+```bash
+python3 -c "import serial; s = serial.Serial('/tmp/ttyV0', 9600); s.write((50).to_bytes(2,'big'))"
+```
+
+### 2. BTCPay Server em testnet
+
+- No BTCPay Server, crie uma loja em modo **testnet** (Bitcoin Testnet).
+- Use carteiras testnet para on-chain (`tb1...`, `m...`, `n...`) e invoices Lightning (`lntb...`).
+- Obtenha tBTC (testnet Bitcoin) gratuitamente em faucets como `coinfaucet.eu` ou `testnet-faucet.com`.
+- O campo `crypto_code = BTC` no `config.ini` continua igual — o BTCPay identifica a rede pela configuração da carteira.
+
+### 3. Impressora física via USB
+
+Com a impressora conectada, descubra o ID USB:
+
+```bash
+lsusb
+# Ex.: Bus 001 Device 003: ID 0416:5011 Winbond Electronics Corp.
+```
+
+Use `0416:5011` (sem `0x`) no campo `printer_usb` do `config.ini`.
+
+Adicione permissão de acesso USB ao seu usuário:
+
+```bash
+sudo usermod -aG lp $USER
+# Reabra a sessão para o grupo ter efeito
+```
+
+### 4. Rodar em ambiente sem monitor
+
+Para testar a GUI sem tela física (ex.: servidor headless):
+
+```bash
+sudo apt-get install -y xvfb
+xvfb-run -a python src/main.py
 ```
 
 ---
@@ -356,14 +408,21 @@ python src/main.py
 - Teste com `sudo` para descartar problema de permissão
 
 **"Cotação indisponível (offline)"**
-- Verifique a conexão com a internet: `ping 8.8.8.8`
-- Verifique se o endereço do BTCPay Server em `config.ini` está correto
+- O ATM testa a conectividade acessando o próprio BTCPay Server. Verifique se ele está acessível:
+  ```bash
+  curl -I https://pay.seuservidor.com
+  ```
+- Confirme que o campo `host` em `config.ini` está correto (URL completa com `https://`)
 - Confira se o API Token foi criptografado corretamente (refaça o passo 5)
 
 **Transações na fila não são processadas**
 - As transações offline ficam em `/var/atm/offline_queue.json`
-- Elas são processadas automaticamente na próxima inicialização com internet
-- Para processar manualmente: `python -c "from atm_core import process_offline_queue; process_offline_queue()"`
+- Elas são processadas automaticamente em segundo plano quando o ATM inicia com internet disponível
+- Para processar manualmente:
+  ```bash
+  source venv/bin/activate
+  python -c "from src.atm_core import process_offline_queue; process_offline_queue()"
+  ```
 
 **Ver os logs do ATM**
 ```bash
