@@ -1,128 +1,134 @@
-# Tutorial de Implementação do Bitcoin ATM
+# Documentação Técnica — Bitcoin ATM
 
-Este tutorial guiará você na configuração e execução do Bitcoin ATM em um sistema Linux AMD64.
+> Para o guia completo de instalação, consulte o [README](../README.md).
 
-## Pré-requisitos
-- **Hardware**: Noteiro BV20, impressora USB (ex.: 0x0416:0x5011).
-- **Sistema**: Linux AMD64 (ex.: Ubuntu 20.04+).
-- **Software**: Python 3.8+, Tor (opcional para anonimato).
-- **Acesso**: Permissões de root para criar diretórios e acessar dispositivos.
+---
 
-## Passo 1: Clonar o Repositório
-Clone o repositório do GitHub:
+## Arquitetura
 
-    git clone https://github.com/seu-usuario/bitcoin-atm.git
-    cd bitcoin-atm
+```
+src/
+├── main.py          — ponto de entrada; inicia Qt, dispara flush da fila em background
+├── atm_gui.py       — interface gráfica (PyQt5); toda I/O bloqueante roda em QThreadPool
+├── atm_core.py      — lógica de negócio: BTCPay API, impressão ESC/POS, fila offline
+├── btc_address.py   — validação com checksum (Base58Check + Bech32/Bech32m + BOLT11)
+└── utils.py         — helpers: QR code, validação de endereço, is_online()
+```
 
-## Passo 2: Instalar Dependências
+---
 
-Instale as bibliotecas necessárias:
+## Threading
 
-    pip install -r requirements.txt
+Todas as chamadas de rede e USB rodam em workers `QRunnable` gerenciados por `QThreadPool`, fora da thread de eventos do Qt. Isso evita que a GUI congele durante:
 
-Certifique-se de que o Tor está rodando (se usado):
+- consultas de cotação ao BTCPay Server (`get_btc_rate` — até 10 s offline)
+- envio de pagamentos (`send_onchain_payment` / `send_lightning_payment` — até 30 s)
+- impressão de recibo (`print_receipt` — USB)
+- processamento da fila offline na inicialização (`process_offline_queue`)
 
-    sudo systemctl start tor
+O padrão usado é `_Worker(_WorkerSignals)` com sinais `result`, `error` e `finished`. Referências ao worker são mantidas em `self._workers` até o sinal `finished` para evitar coleta de lixo prematura.
 
-## Passo 3: Gerar Chave de Criptografia
+---
 
-Gere uma chave para criptografar dados sensíveis:
+## Segurança financeira
 
-    sudo mkdir -p /etc/atm
-    sudo python scripts/generate_key.py
-    sudo chmod 600 /etc/atm/key
+### Classificação de exceções
 
-## Passo 4: Configurar o Arquivo config.ini
+| Exceção | Significado | Ação |
+|---|---|---|
+| `PaymentNotBroadcast` | Certamente NÃO foi transmitido (sem conexão, 4xx) | Seguro enfileirar |
+| `PaymentUncertain` | Resultado ambíguo (timeout, 5xx) | **Não reenfileirar** — operador confere manualmente |
 
-1. Copie o exemplo:
+Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviado, a transação é descartada da fila com um log de erro e o operador deve verificar a carteira no BTCPay Server.
 
-        cp config.ini.example config.ini
+### Precisão decimal
 
-2. Edite config.ini com suas informações:
+Conversões BRL→BTC usam `decimal.Decimal` com `ROUND_DOWN` para nunca enviar mais do que o cliente pagou:
 
-- host, store_id, wallet_id, etc., do BTCPay Server.
-- Porta serial do noteiro (ex.: /dev/ttyUSB0).
-- ID da impressora USB.
-- chat_id do Telegram (obtenha com telegram-send --configure).
+```python
+def brl_to_btc(amount_brl, rate):
+    return (Decimal(str(amount_brl)) / Decimal(str(rate))).quantize(
+        Decimal('0.00000001'), rounding=ROUND_DOWN)
+```
 
-3. Criptografe o api_token:
+### Token da API
 
-        python
+O token BTCPay é armazenado **criptografado** com Fernet (chave AES-128-CBC) em `config.ini`. A chave fica em `/etc/atm/key` com permissão `600`. Sem a chave, o token cifrado é inútil.
 
-        from cryptography.fernet import Fernet
-        with open('/etc/atm/key', 'rb') as f:
-            cipher = Fernet(f.read())
-        token = "seu_token_aqui"
-        encrypted_token = cipher.encrypt(token.encode()).decode()
-        print(encrypted_token)
+---
 
-4. Insira o resultado em api_token no config.ini.
+## Validação de endereços Bitcoin
 
-## Passo 5: Configurar Permissões
-Crie diretórios e configure permissões:
+`btc_address.py` implementa validação com checksum em Python puro (sem dependências externas):
 
+| Tipo | Exemplos | Algoritmo |
+|---|---|---|
+| Legacy P2PKH/P2SH | `1...`, `3...`, `m...`, `n...`, `2...` | Base58Check (double-SHA256) |
+| SegWit v0 (P2WPKH/P2WSH) | `bc1q...`, `tb1q...` | Bech32 (BIP173) |
+| Taproot / SegWit v1+ | `bc1p...`, `tb1p...` | Bech32m (BIP350) |
+| Lightning BOLT11 | `lnbc...`, `lntb...`, `lnbcrt...` | Bech32 sem limite de 90 chars |
 
-    sudo mkdir -p /var/atm /var/log
-    sudo chown $USER:$USER /var/atm /var/log
-    sudo chmod 700 /var/atm
-    sudo chmod +rw /dev/ttyUSB0  # Ajuste conforme sua porta serial
+Redes aceitas: mainnet (`bc`, `1`, `3`), testnet/signet (`tb`, `m`, `n`), regtest (`bcrt`, `2`).
 
-## Passo 6: Testar a Aplicação
-1. Execute o ATM:
+---
 
-        python src/main.py
+## API BTCPay Server (Greenfield v1)
 
-2. Insira uma nota no noteiro para testar.
+### Cotação
 
-3. Escaneie um QR code (simulado por padrão após 5s).
+```
+GET /api/v1/stores/{storeId}/rates?currencyPair=BTC_BRL
+```
 
-## Passo 7: Configurar Telegram
-1. Configure o telegram-send:
+### Pagamento on-chain
 
-        telegram-send --configure
+```
+POST /api/v1/stores/{storeId}/payment-methods/BTC-CHAIN/wallet/transactions
+```
 
-2. Siga as instruções para vincular ao seu bot Telegram.
+O método (`BTC-CHAIN`) pode ser sobrescrito via `onchain_payment_method` no `config.ini` para instâncias antigas. O campo `feerate` é omitido intencionalmente para usar a estimativa automática do BTCPay (enviar `null` causa erro 422).
 
-## Passo 8: Implantação em Produção
-1. Adicione como serviço systemd:
+### Pagamento Lightning
 
-        sudo nano /etc/systemd/system/bitcoin-atm.service
+```
+POST /api/v1/stores/{storeId}/lightning/BTC/invoices/pay
+```
 
-2. Cole o conteúdo abaixo no arquivo:
+Status `200` = completo, `202` = pendente (ambos tratados como enviado), `Failed` = não enviado → seguro reenfileirar.
 
-        ini
+---
 
-        [Unit]
-        Description=Bitcoin ATM Service
-        After=network.target
+## Fila offline
 
-        [Service]
-        ExecStart=/usr/bin/python3 /path/to/bitcoin-atm/src/main.py
-        WorkingDirectory=/path/to/bitcoin-atm
-        Restart=always
-        User=seu_usuario
+Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/offline_queue.json`. Na próxima inicialização, se `is_online()` retornar `True`, `process_offline_queue()` é executado em background (via `QThreadPool`) sem bloquear a GUI.
 
-        [Install]
-        WantedBy=multi-user.target
+`is_online()` verifica conectividade fazendo `HEAD` no host do BTCPay configurado — não usa servidores externos (compatível com ambientes Tor).
 
-3. Inicie o serviço
+---
 
-        sudo systemctl enable bitcoin-atm
-        sudo systemctl start bitcoin-atm
+## Configuração (`config.ini`)
 
-## Solução de Problemas
+| Campo | Seção | Descrição |
+|---|---|---|
+| `host` | `btcpay` | URL completa do BTCPay Server |
+| `store_id` | `btcpay` | ID da loja no BTCPay |
+| `api_token` | `btcpay` | Token Fernet-criptografado |
+| `currency` | `btcpay` | Moeda fiduciária (ex.: `BRL`) |
+| `crypto_code` | `btcpay` | Código da cripto (ex.: `BTC`) |
+| `onchain_payment_method` | `btcpay` | (Opcional) Sobrescreve `BTC-CHAIN` |
+| `serial_port` | `hardware` | Porta serial do noteiro (ex.: `/dev/ttyUSB0`) |
+| `baud_rate` | `hardware` | Baud rate serial (ex.: `9600`) |
+| `printer_usb` | `hardware` | ID USB da impressora `vendor:product` (ex.: `0416:5011`) |
+| `chat_id` | `telegram` | ID do chat para alertas |
 
-- Logs: Verifique /var/log/btc_atm.log.
+---
 
-- Telegram: Certifique-se de que o chat_id está correto.
+## Logs
 
-- Hardware: Confirme que os dispositivos estão conectados e acessíveis.
+O ATM registra em `/var/log/btc_atm.log`. Se não tiver permissão de escrita (ex.: em desenvolvimento), cai automaticamente para `stderr`. Para seguir os logs em tempo real:
 
-## Personalizações
-- Substitua a simulação de QR code em main.py por um leitor real.
-
-- Ajuste o estilo da GUI em atm_gui.py.
-
-
-Com isso, seu Bitcoin ATM estará pronto para uso!
-
+```bash
+tail -f /var/log/btc_atm.log
+# ou, se rodando como serviço systemd:
+sudo journalctl -u bitcoin-atm -f
+```
