@@ -34,7 +34,9 @@ ATM lê o valor via noteiro serial (BV20)
        ↓
 Cliente escolhe: On-Chain ou Lightning
        ↓
-Cliente escaneia QR code da sua carteira
+Cliente apresenta o destino:
+  • On-Chain  → endereço Bitcoin (bc1.../1.../3...)
+  • Lightning → invoice BOLT11 OU endereço Lightning (voce@walletofsatoshi.com)
        ↓
 ATM consulta cotação BTC/BRL no BTCPay Server
        ↓
@@ -261,11 +263,15 @@ A interface gráfica deve abrir em tela cheia. Para sair, pressione `Alt+F4`.
 1. O ATM exibe a cotação BTC/BRL (atualizada a cada 30 segundos).
 2. Insira uma cédula no noteiro. O valor deve aparecer na tela.
 3. Escolha "Enviar On-Chain" ou "Enviar via Lightning".
-4. Aponte o leitor QR para o endereço da sua carteira de teste.
-5. O endereço aparece na tela e o botão "Confirmar" é habilitado.
+4. Apresente o destino:
+   - **On-Chain:** aponte o leitor QR para o endereço Bitcoin da sua carteira de teste.
+   - **Lightning:** escaneie uma invoice BOLT11 (`lntb...`) **ou** digite/escaneie um endereço Lightning (ex.: `voce@walletofsatoshi.com`).
+5. O destino aparece na tela e o botão "Confirmar" é habilitado.
 6. Clique em "Confirmar". O Bitcoin é enviado e o recibo é impresso.
 
 > **Dica:** Use valores pequenos para os primeiros testes e uma carteira de teste separada.
+
+> **Endereço Lightning (Lightning Address):** carteiras como **Wallet of Satoshi**, **Blink** e **Phoenix** fornecem um endereço fixo no formato `usuario@dominio.com`. O ATM o resolve automaticamente em uma invoice (protocolo LNURL-pay) e verifica que o valor da invoice é exatamente o solicitado antes de pagar — o cliente não precisa gerar uma invoice manualmente.
 
 ---
 
@@ -359,6 +365,7 @@ python3 -c "import serial; s = serial.Serial('/tmp/ttyV0', 9600); s.write((50).t
 - Use carteiras testnet para on-chain (`tb1...`, `m...`, `n...`) e invoices Lightning (`lntb...`).
 - Obtenha tBTC (testnet Bitcoin) gratuitamente em faucets como `coinfaucet.eu` ou `testnet-faucet.com`.
 - O campo `crypto_code = BTC` no `config.ini` continua igual — o BTCPay identifica a rede pela configuração da carteira.
+- **Lightning Address na testnet:** endereços `usuario@dominio.com` resolvem para uma invoice na rede do provedor. A maioria dos provedores (Wallet of Satoshi etc.) é mainnet; para testar o fluxo de endereço em testnet, use um provedor LNURL-pay testnet ou teste o caminho de invoice BOLT11 (`lntb...`) diretamente.
 
 ### 3. Impressora física via USB
 
@@ -414,6 +421,15 @@ python src/main.py
   ```
 - Confirme que o campo `host` em `config.ini` está correto (URL completa com `https://`)
 - Confira se o API Token foi criptografado corretamente (refaça o passo 5)
+
+**Endereço Lightning não é aceito / falha ao pagar**
+- O endereço precisa ter o formato `usuario@dominio.com` (ex.: `voce@walletofsatoshi.com`).
+- O ATM precisa de acesso de saída à internet para resolver o endereço (`https://dominio/.well-known/lnurlp/usuario`). Teste:
+  ```bash
+  curl https://walletofsatoshi.com/.well-known/lnurlp/SEU_USUARIO
+  ```
+- Cada provedor tem limites mínimo/máximo de valor (`minSendable`/`maxSendable`). Se o valor da cédula ficar fora desses limites, a transação é recusada com segurança (nada é enviado) e enfileirada.
+- Se o provedor devolver uma invoice com valor diferente do solicitado, o ATM recusa o pagamento para proteger o cliente (anti-overpayment).
 
 **Transações na fila não são processadas**
 - As transações offline ficam em `/var/atm/offline_queue.json`

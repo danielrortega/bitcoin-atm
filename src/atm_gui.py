@@ -7,7 +7,7 @@ from PyQt5.QtGui import QFont
 from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment,
                       send_lightning_payment, print_receipt, enqueue_transaction,
                       brl_to_btc, PaymentNotBroadcast)
-from utils import is_valid_bitcoin_address, is_valid_lightning_invoice
+from utils import is_valid_bitcoin_address, is_valid_lightning_destination
 
 
 # --------------------------------------------------------------------------
@@ -241,7 +241,12 @@ class BTMWindow(QMainWindow):
 
     def select_payment(self, payment_type):
         self.payment_type = payment_type
-        self.instruction_label.setText("Escaneie o QR code da sua carteira")
+        if payment_type == "lightning":
+            self.instruction_label.setText(
+                "Escaneie a invoice OU informe seu endereço Lightning "
+                "(ex.: voce@walletofsatoshi.com)")
+        else:
+            self.instruction_label.setText("Escaneie o QR code da sua carteira")
         self.status_label.setText("Aguardando QR code...")
         self.onchain_button.setEnabled(False)
         self.lightning_button.setEnabled(False)
@@ -257,7 +262,7 @@ class BTMWindow(QMainWindow):
             return
         valid = (
             (self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination))
-            or (self.payment_type == "lightning" and is_valid_lightning_invoice(self.destination))
+            or (self.payment_type == "lightning" and is_valid_lightning_destination(self.destination))
         )
         if valid:
             self.status_label.setText(f"Endereço detectado: {self.destination[:10]}...")
@@ -281,7 +286,7 @@ class BTMWindow(QMainWindow):
         if self.payment_type == "onchain":
             valid = is_valid_bitcoin_address(self.destination)
         else:
-            valid = is_valid_lightning_invoice(self.destination)
+            valid = is_valid_lightning_destination(self.destination)
         if not valid:
             QMessageBox.warning(self, "Endereço inválido",
                 "Endereço/invoice inválido para o método escolhido.")

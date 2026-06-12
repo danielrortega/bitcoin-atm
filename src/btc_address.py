@@ -4,6 +4,8 @@ Implementação em Python puro (sem dependências externas) de:
 - Base58Check  (endereços legados P2PKH/P2SH: 1.., 3.., m.., n.., 2..)
 - Bech32 / Bech32m (SegWit: bc1.., tb1.., bcrt1..) conforme BIP173 e BIP350
 - Verificação do checksum bech32 de invoices Lightning (BOLT11)
+- Validação de Lightning Address (user@domain, LUD-16/LNURL-pay)
+- Decodificação do valor (msats) codificado no HRP de uma invoice BOLT11
 
 Aceita redes mainnet e testnet/signet/regtest (a POC roda em testnet).
 A validação por checksum protege contra endereços digitados/escaneados
@@ -11,6 +13,8 @@ incorretamente — algo que a checagem por prefixo anterior não fazia.
 """
 
 import hashlib
+import re
+from decimal import Decimal
 
 # --------------------------------------------------------------------------
 # Base58Check (BIP- legado)
@@ -178,3 +182,74 @@ def validate_lightning_invoice(invoice):
     # BOLT11 é bech32 (não bech32m) e remove o limite de 90 caracteres.
     hrp, data, spec = _bech32_decode(inv, max_length=2000)
     return spec == 'bech32' and hrp is not None and bool(data)
+
+
+# --------------------------------------------------------------------------
+# Lightning Address (LUD-16 / LNURL-pay) — ex.: voce@walletofsatoshi.com
+# --------------------------------------------------------------------------
+# user: a-z0-9-_. (LUD-16); domain: rótulos alfanuméricos + TLD de letras
+# (cobre também .onion). Validação de formato apenas; a resolução real é
+# feita em atm_core via HTTP.
+_LN_ADDRESS_RE = re.compile(
+    r'^[a-z0-9._-]+@([a-z0-9-]+\.)+[a-z]{2,}$', re.IGNORECASE)
+
+
+def validate_lightning_address(address):
+    """True se a string tiver o formato de um Lightning Address (user@domain).
+    Não faz a resolução de rede — apenas valida o formato para a GUI decidir
+    se habilita o botão de confirmação."""
+    if not isinstance(address, str):
+        return False
+    addr = address.strip()
+    if not addr or '@' not in addr or any(c.isspace() for c in addr):
+        return False
+    return bool(_LN_ADDRESS_RE.match(addr))
+
+
+# --------------------------------------------------------------------------
+# Decodificação do valor (msats) no HRP de uma invoice BOLT11
+# --------------------------------------------------------------------------
+# Multiplicadores BOLT11 (fração de BTC). Sem multiplicador → BTC inteiro.
+_BOLT11_MULTIPLIERS = {
+    'm': Decimal('0.001'),          # milli
+    'u': Decimal('0.000001'),       # micro
+    'n': Decimal('0.000000001'),    # nano
+    'p': Decimal('0.000000000001'), # pico
+}
+# Ordem importa: 'lnbcrt' antes de 'lnbc' para casar o prefixo mais longo.
+_BOLT11_PREFIXES = ('lnbcrt', 'lntb', 'lnbc')
+_MSATS_PER_BTC = Decimal(100_000_000_000)  # 1 BTC = 1e8 sat = 1e11 msat
+
+
+def decode_bolt11_amount_msats(invoice):
+    """Extrai o valor (em millisatoshis) codificado no HRP de uma invoice
+    BOLT11. Retorna int (msats) ou None se a invoice não tiver valor
+    (amountless), for inválida, ou o valor não for um número inteiro de msat.
+
+    Usado como verificação de segurança ao pagar um Lightning Address: a
+    invoice retornada precisa ter exatamente o valor solicitado."""
+    if not isinstance(invoice, str):
+        return None
+    inv = invoice.strip().lower()
+    sep = inv.rfind('1')
+    if sep < 1:
+        return None
+    hrp = inv[:sep]
+    prefix = next((p for p in _BOLT11_PREFIXES if hrp.startswith(p)), None)
+    if prefix is None:
+        return None
+    amount_part = hrp[len(prefix):]
+    if not amount_part:
+        return None  # invoice sem valor (amountless)
+    if amount_part[-1] in _BOLT11_MULTIPLIERS:
+        digits, factor = amount_part[:-1], _BOLT11_MULTIPLIERS[amount_part[-1]]
+    else:
+        digits, factor = amount_part, Decimal(1)
+    if not digits.isdigit():
+        return None
+    msats = Decimal(digits) * factor * _MSATS_PER_BTC
+    # Com multiplicador 'p', o valor precisa ser múltiplo de 10 pico-BTC para
+    # resultar num número inteiro de msat; caso contrário é inválido.
+    if msats != msats.to_integral_value():
+        return None
+    return int(msats)

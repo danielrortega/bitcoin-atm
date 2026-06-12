@@ -67,8 +67,42 @@ O token BTCPay é armazenado **criptografado** com Fernet (chave AES-128-CBC) em
 | SegWit v0 (P2WPKH/P2WSH) | `bc1q...`, `tb1q...` | Bech32 (BIP173) |
 | Taproot / SegWit v1+ | `bc1p...`, `tb1p...` | Bech32m (BIP350) |
 | Lightning BOLT11 | `lnbc...`, `lntb...`, `lnbcrt...` | Bech32 sem limite de 90 chars |
+| Lightning Address | `voce@walletofsatoshi.com` | Validação de formato (LUD-16) |
 
 Redes aceitas: mainnet (`bc`, `1`, `3`), testnet/signet (`tb`, `m`, `n`), regtest (`bcrt`, `2`).
+
+No fluxo Lightning, o destino aceito é uma invoice BOLT11 **ou** um Lightning Address (`is_valid_lightning_destination` em `utils.py`). O endereço é validado apenas no formato pela GUI; a resolução de rede acontece no momento do pagamento.
+
+---
+
+## Lightning Address (LUD-16 / LNURL-pay)
+
+Para não exigir que o cliente gere uma invoice manualmente, o ATM aceita um
+endereço Lightning fixo (ex.: `voce@walletofsatoshi.com`) e o resolve em uma
+invoice BOLT11 com o valor exato, em `atm_core._resolve_lightning_address`:
+
+1. `GET https://{domain}/.well-known/lnurlp/{user}` → metadados com `callback`,
+   `minSendable` e `maxSendable` (em msat). Valida `tag == "payRequest"`.
+2. Confere se o valor solicitado (msats) está dentro de `[minSendable, maxSendable]`.
+3. `GET {callback}?amount={msats}` → resposta com `pr` (a invoice BOLT11).
+4. **Verificação anti-overpayment:** `decode_bolt11_amount_msats(pr)` decodifica o
+   valor codificado no HRP da invoice e exige que seja **exatamente** o solicitado.
+   Se divergir, levanta `PaymentNotBroadcast` e nada é enviado.
+5. A invoice resultante é paga pelo caminho BOLT11 normal.
+
+**Classificação de erros:** toda a resolução ocorre *antes* de qualquer chamada
+de pagamento ao BTCPay, então qualquer falha (rede, HTTP ≠ 200, JSON inválido,
+valor fora dos limites, valor divergente) é `PaymentNotBroadcast` — seguro
+reenfileirar, pois nenhum fundo saiu. Domínios `.onion` usam `http` (via Tor);
+clearnet exige `https`.
+
+**Compatibilidade:** funciona com qualquer carteira que implemente LNURL-pay —
+Wallet of Satoshi, Blink, Phoenix, etc. O endereço é fixo, então o cliente pode
+manter um QR impresso.
+
+**Limitação conhecida:** a verificação do `description_hash` da invoice contra o
+`metadata` (LUD-06) não é feita; apenas o valor é verificado. A invoice na fila
+offline é resolvida novamente no reprocessamento (gera uma invoice nova).
 
 ---
 

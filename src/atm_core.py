@@ -11,6 +11,8 @@ import telegram_send
 from cryptography.fernet import Fernet
 from escpos.printer import Usb
 
+from btc_address import decode_bolt11_amount_msats, validate_lightning_address
+
 _LOG_PATH = '/var/log/btc_atm.log'
 _LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
 try:
@@ -24,6 +26,7 @@ _QUEUE_PATH = '/var/atm/offline_queue.json'
 _KEY_PATH = '/etc/atm/key'
 
 _SATOSHI = Decimal('0.00000001')
+_LNURL_TIMEOUT = 15  # segundos para cada chamada HTTP de resolução LNURL-pay
 
 
 class PaymentNotBroadcast(Exception):
@@ -152,12 +155,88 @@ def send_onchain_payment(amount_brl, address, rate):
     return txid
 
 
-def send_lightning_payment(amount_brl, invoice, rate):
+def _resolve_lightning_address(address, amount_btc):
+    """Resolve um Lightning Address (user@domain) em uma invoice BOLT11 para
+    o valor exato (LUD-16 / LNURL-pay), em duas chamadas HTTP:
+
+      1. GET https://domain/.well-known/lnurlp/user  → metadados (callback,
+         minSendable/maxSendable em msat)
+      2. GET <callback>?amount=<msats>               → { "pr": "lntb..." }
+
+    Toda a resolução acontece ANTES de qualquer chamada de pagamento ao
+    BTCPay, então qualquer falha aqui é PaymentNotBroadcast (nada foi enviado
+    → seguro reenfileirar). Verifica também se a invoice retornada tem
+    exatamente o valor solicitado, protegendo o cliente contra um endpoint
+    que devolva um valor diferente."""
+    user, domain = address.split('@', 1)
+    # Onion pode usar http puro (via Tor); clearnet exige https (LUD-16).
+    scheme = 'http' if domain.lower().endswith('.onion') else 'https'
+    lnurl_url = f"{scheme}://{domain}/.well-known/lnurlp/{user}"
+
+    # Valor solicitado em millisatoshis (amount_btc já está em múltiplos de sat).
+    sats = int((amount_btc / _SATOSHI).to_integral_value())
+    msats = sats * 1000
+    if msats <= 0:
+        raise PaymentNotBroadcast(f"valor muito baixo para Lightning: {amount_btc} BTC")
+
+    meta = _lnurl_get_json(lnurl_url, f"resolver {address}")
+    if meta.get('tag') != 'payRequest' or 'callback' not in meta:
+        raise PaymentNotBroadcast(f"{address} não é um endereço LNURL-pay válido")
+    try:
+        min_s = int(meta.get('minSendable', 0))
+        max_s = int(meta.get('maxSendable', 0))
+    except (TypeError, ValueError) as e:
+        raise PaymentNotBroadcast(f"limites LNURL inválidos para {address}: {e}") from e
+    if not (min_s <= msats <= max_s):
+        raise PaymentNotBroadcast(
+            f"valor {msats} msat fora do permitido [{min_s}, {max_s}] por {address}")
+
+    callback = meta['callback']
+    sep = '&' if '?' in callback else '?'
+    data = _lnurl_get_json(f"{callback}{sep}amount={msats}", f"obter invoice de {address}")
+    if data.get('status') == 'ERROR':
+        raise PaymentNotBroadcast(f"LNURL recusou: {data.get('reason', data)}")
+    invoice = data.get('pr')
+    if not invoice:
+        raise PaymentNotBroadcast(f"LNURL não retornou invoice para {address}: {data}")
+
+    # Segurança: a invoice precisa ter exatamente o valor solicitado.
+    got = decode_bolt11_amount_msats(invoice)
+    if got != msats:
+        raise PaymentNotBroadcast(
+            f"invoice de {address} com valor inesperado "
+            f"(esperado {msats} msat, obtido {got})")
+    logging.info("Lightning address %s resolvido para invoice de %s msat", address, msats)
+    return invoice
+
+
+def _lnurl_get_json(url, context):
+    """GET HTTP que retorna JSON, classificando falhas como PaymentNotBroadcast
+    (a resolução ocorre antes do pagamento, então nada foi transmitido)."""
+    try:
+        resp = requests.get(url, timeout=_LNURL_TIMEOUT)
+    except requests.RequestException as e:
+        raise PaymentNotBroadcast(f"falha de rede ao {context}: {e}") from e
+    if resp.status_code != 200:
+        raise PaymentNotBroadcast(f"falha ao {context}: HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except ValueError as e:
+        raise PaymentNotBroadcast(f"resposta inválida ao {context}: {e}") from e
+
+
+def send_lightning_payment(amount_brl, destination, rate):
     cfg = _load_config()
     host = cfg['btcpay']['host'].rstrip('/')
     store_id = cfg['btcpay']['store_id']
     crypto = cfg['btcpay'].get('crypto_code', 'BTC')
     amount_btc = brl_to_btc(amount_brl, rate)
+    # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
+    # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
+    if validate_lightning_address(destination):
+        invoice = _resolve_lightning_address(destination, amount_btc)
+    else:
+        invoice = destination
     url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
     payload = {'BOLT11': invoice}
     resp = _post_payment(url, payload)
@@ -176,7 +255,8 @@ def send_lightning_payment(amount_brl, invoice, rate):
     # 'Pending' é tratado como enviado: a invoice é de uso único, então um
     # reenvio do mesmo BOLT11 não causa pagamento duplicado.
     logging.info("Lightning payment: %s BTC status=%s hash=%s", amount_btc, status, payment_hash)
-    _send_telegram(amount_brl, amount_btc, invoice, payment_hash, 'lightning')
+    # Registra o destino original (endereço ou invoice) para o operador.
+    _send_telegram(amount_brl, amount_btc, destination, payment_hash, 'lightning')
     return payment_hash
 
 
