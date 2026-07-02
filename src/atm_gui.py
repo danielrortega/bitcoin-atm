@@ -1,3 +1,4 @@
+import logging
 import time
 
 from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
@@ -62,6 +63,10 @@ def _execute_payment(amount_brl, destination, payment_type, rate, rate_stale):
 
 
 class BTMWindow(QMainWindow):
+    # Denominações válidas das cédulas de real (BRL). Qualquer leitura fora
+    # deste conjunto é tratada como ruído/erro e descartada — nunca creditada.
+    VALID_DENOMINATIONS = frozenset({2, 5, 10, 20, 50, 100, 200})
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bitcoin ATM")
@@ -211,14 +216,25 @@ class BTMWindow(QMainWindow):
     # Leitura de notas
     # ----------------------------------------------------------------------
     def check_note(self):
-        if self._payment_in_flight:
+        # SEMPRE drena o buffer serial primeiro — inclusive durante um pagamento.
+        # Se só drenássemos quando ocioso, os bytes que chegam enquanto o
+        # pagamento roda ficariam no buffer e seriam creditados como uma "nota
+        # fantasma" logo após o reset. A leitura roda dentro de um slot de
+        # QTimer: uma exceção aqui (noteiro desconectado) abortaria o processo
+        # (qFatal do PyQt5) e, com Restart=always, entraria em crash-loop —
+        # por isso é protegida.
+        try:
+            pending = self.note_reader.in_waiting
+            data = self.note_reader.read(pending) if pending > 0 else b''
+        except Exception as e:
+            logging.error("Falha ao ler o noteiro serial: %s", e)
             return
-        if self.note_reader.in_waiting > 0:
-            # Sempre drena o buffer serial para não acumular, mas só aceita
-            # uma nova nota enquanto o cliente ainda está escolhendo o método.
-            # Pulsos espúrios durante o pagamento em andamento são ignorados.
-            data = self.note_reader.read(self.note_reader.in_waiting)
-            note_value = int.from_bytes(data, "big") if data else None
+
+        if self._payment_in_flight:
+            return  # buffer já drenado; ignora qualquer entrada durante o envio
+
+        if data:
+            note_value = self._parse_note(data)
             if note_value and self.payment_type is None and self.destination is None:
                 self.amount_brl = note_value
                 self.start_time = time.time()
@@ -226,12 +242,27 @@ class BTMWindow(QMainWindow):
                 self.instruction_label.setText("Escolha o método de envio")
                 self.onchain_button.setEnabled(True)
                 self.lightning_button.setEnabled(True)
-        elif self.start_time and (time.time() - self.start_time > 30) and not self.destination:
+            return
+
+        if self.start_time and (time.time() - self.start_time > 30) and not self.destination:
             self.status_label.setText(f"Nota detectada: R${self.amount_brl} - Cotação atualizada")
             self.update_rate()
             self.start_time = time.time()
         elif self.destination:
             self.check_qr_input()
+
+    def _parse_note(self, data):
+        """Interpreta os bytes do noteiro como um valor em BRL e valida contra
+        as denominações reais de cédulas. Rejeita ruído elétrico e frames de
+        duas notas concatenados no buffer — que, com int.from_bytes sobre o
+        buffer inteiro, virariam um valor astronômico. Sem esta whitelist, um
+        glitch poderia creditar R$ milhões e convertê-los em Bitcoin real."""
+        value = int.from_bytes(data, "big")
+        if value in self.VALID_DENOMINATIONS:
+            return value
+        logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
+                        value, data.hex())
+        return None
 
     def _on_address_changed(self, text):
         if self._payment_in_flight:

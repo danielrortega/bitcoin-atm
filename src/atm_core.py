@@ -1,9 +1,13 @@
 import configparser
+import ipaddress
 import json
 import logging
 import os
+import socket
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlparse
 
 import requests
 import serial
@@ -27,6 +31,17 @@ _KEY_PATH = '/etc/atm/key'
 
 _SATOSHI = Decimal('0.00000001')
 _LNURL_TIMEOUT = 15  # segundos para cada chamada HTTP de resolução LNURL-pay
+_LNURL_MAX_BYTES = 65536  # teto do corpo de resposta LNURL (anti-DoS de memória)
+
+# Serializa todo acesso à fila offline. GUI (enqueue) e o worker de background
+# (process_offline_queue) rodam no mesmo processo em threads diferentes; sem
+# este lock, o read-modify-write concorrente perderia transações ou reprocessaria
+# pagamentos (gasto duplo).
+_QUEUE_LOCK = threading.RLock()
+
+# Idade máxima (s) da cotação salva numa transação enfileirada. Acima disso,
+# busca-se uma cotação fresca ao liquidar, para não usar um preço obsoleto.
+_QUEUE_RATE_MAX_AGE = 120
 
 
 class PaymentNotBroadcast(Exception):
@@ -210,17 +225,63 @@ def _resolve_lightning_address(address, amount_btc):
     return invoice
 
 
+def _assert_safe_lnurl_url(url):
+    """Defesa anti-SSRF: o domínio e a URL de callback do LNURL vêm do cliente
+    (e de um servidor que ele controla). Sem esta checagem, um cliente hostil
+    poderia fazer o ATM emitir requisições a serviços internos (localhost, RPC
+    do bitcoind, metadados de nuvem em 169.254.169.254 etc.).
+
+    Exige https (http só para .onion), e para clearnet resolve o host e recusa
+    qualquer IP privado/loopback/link-local/reservado. Resta um TOCTOU teórico
+    (DNS rebinding entre esta resolução e a do requests); o bloqueio de
+    redirects em _lnurl_get_json reduz a superfície restante."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise PaymentNotBroadcast(f"URL LNURL inválida: {url}")
+    is_onion = host.lower().endswith('.onion')
+    if parsed.scheme == 'https' or (parsed.scheme == 'http' and is_onion):
+        pass
+    else:
+        raise PaymentNotBroadcast(f"esquema LNURL não permitido: {parsed.scheme}")
+    if is_onion:
+        return  # resolvido pelo Tor; não há IP local para inspecionar
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise PaymentNotBroadcast(f"não foi possível resolver {host}: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise PaymentNotBroadcast(
+                f"host LNURL {host} aponta para endereço interno ({ip}) — bloqueado")
+
+
 def _lnurl_get_json(url, context):
     """GET HTTP que retorna JSON, classificando falhas como PaymentNotBroadcast
-    (a resolução ocorre antes do pagamento, então nada foi transmitido)."""
+    (a resolução ocorre antes do pagamento, então nada foi transmitido).
+    Bloqueia alvos internos (anti-SSRF), não segue redirects (um redirect para
+    um host interno driblaria a checagem) e limita o tamanho do corpo."""
+    _assert_safe_lnurl_url(url)
     try:
-        resp = requests.get(url, timeout=_LNURL_TIMEOUT)
+        resp = requests.get(url, timeout=_LNURL_TIMEOUT,
+                            allow_redirects=False, stream=True)
     except requests.RequestException as e:
         raise PaymentNotBroadcast(f"falha de rede ao {context}: {e}") from e
-    if resp.status_code != 200:
-        raise PaymentNotBroadcast(f"falha ao {context}: HTTP {resp.status_code}")
     try:
-        return resp.json()
+        if resp.status_code in (301, 302, 303, 307, 308):
+            raise PaymentNotBroadcast(f"redirect não permitido ao {context}")
+        if resp.status_code != 200:
+            raise PaymentNotBroadcast(f"falha ao {context}: HTTP {resp.status_code}")
+        raw = resp.raw.read(_LNURL_MAX_BYTES + 1, decode_content=True)
+        if len(raw) > _LNURL_MAX_BYTES:
+            raise PaymentNotBroadcast(f"resposta LNURL grande demais ao {context}")
+    finally:
+        resp.close()
+    try:
+        return json.loads(raw)
     except ValueError as e:
         raise PaymentNotBroadcast(f"resposta inválida ao {context}: {e}") from e
 
@@ -278,44 +339,83 @@ def print_receipt(amount_brl, amount_btc, destination, txid):
 
 
 def enqueue_transaction(amount_brl, destination, payment_type, rate):
-    queue = _load_queue()
-    queue.append({
-        'amount_brl': amount_brl,
-        'destination': destination,
-        'payment_type': payment_type,
-        'rate': rate,
-        'timestamp': time.time(),
-    })
-    _save_queue(queue)
+    with _QUEUE_LOCK:
+        queue = _load_queue()
+        queue.append({
+            'amount_brl': amount_brl,
+            'destination': destination,
+            'payment_type': payment_type,
+            'rate': rate,
+            'timestamp': time.time(),
+        })
+        _save_queue(queue)
     logging.info("Transaction enqueued: %s BRL to %s (%s)", amount_brl, destination, payment_type)
 
 
+def _fresh_rate_for(tx):
+    """Só reaproveita a cotação salva se ela for recente; caso contrário busca
+    uma fresca. Impede liquidar horas/dias depois com um preço obsoleto (que,
+    se menor que o atual, faria o ATM enviar BTC a mais)."""
+    stored = tx.get('rate')
+    age = time.time() - tx.get('timestamp', 0)
+    if stored and age <= _QUEUE_RATE_MAX_AGE:
+        return stored
+    return get_btc_rate()
+
+
 def process_offline_queue():
-    queue = _load_queue()
-    if not queue:
-        return
-    remaining = []
-    for tx in queue:
+    """Processa a fila offline com garantia de NO-MÁXIMO-UMA-VEZ por transação.
+
+    Cada transação é REMOVIDA da fila persistida ANTES da tentativa de envio.
+    Assim, um crash/queda de energia durante o envio não faz o pagamento ser
+    retransmitido no próximo processamento — preferimos, no pior caso, perder
+    o registro (reconciliável pelos logs) a arriscar um gasto duplo. Só uma
+    falha comprovadamente-não-transmitida (PaymentNotBroadcast) recoloca a
+    transação na fila."""
+    while True:
+        with _QUEUE_LOCK:
+            queue = _load_queue()
+            if not queue:
+                return
+            tx = queue.pop(0)
+            _save_queue(queue)  # a partir daqui, tx não está mais persistida
+
         try:
-            rate = tx.get('rate') or get_btc_rate()
+            rate = _fresh_rate_for(tx)
             if not rate:
-                remaining.append(tx)
-                continue
+                # Sem cotação: nada foi enviado → seguro reenfileirar. Para de
+                # processar (as demais provavelmente falhariam igual); tenta de
+                # novo no próximo ciclo.
+                _requeue(tx)
+                logging.warning("Sem cotação para processar a fila; adiada.")
+                return
             if tx['payment_type'] == 'onchain':
                 txid = send_onchain_payment(tx['amount_brl'], tx['destination'], rate)
             else:
                 txid = send_lightning_payment(tx['amount_brl'], tx['destination'], rate)
+            # Daqui em diante o dinheiro saiu: NADA pode reenfileirar esta tx.
             amount_btc = brl_to_btc(tx['amount_brl'], rate)
             print_receipt(tx['amount_brl'], amount_btc, tx['destination'], txid)
             logging.info("Offline queue tx processed: %s", txid)
+        except PaymentNotBroadcast as e:
+            # Comprovadamente não transmitido → seguro recolocar na fila.
+            logging.warning("Queued tx not broadcast, re-queued: %s", e)
+            _requeue(tx)
         except PaymentUncertain as e:
-            # Resultado ambíguo: não recoloca na fila para não arriscar
-            # gasto duplo num reprocessamento futuro. Operador deve conferir.
+            # Ambíguo (já removida da fila): NÃO reenfileira, para não arriscar
+            # gasto duplo. Operador confere a carteira.
             logging.error("Queued tx UNCERTAIN, dropped to avoid double-spend: %s", e)
         except Exception as e:
-            logging.error("Failed to process queued tx: %s", e)
-            remaining.append(tx)
-    _save_queue(remaining)
+            # Erro inesperado após um possível envio (já removida): não
+            # reenfileira. Registra para reconciliação manual.
+            logging.error("Queued tx failed post-removal, NOT re-queued: %s", e)
+
+
+def _requeue(tx):
+    with _QUEUE_LOCK:
+        queue = _load_queue()
+        queue.append(tx)
+        _save_queue(queue)
 
 
 def _load_queue():
@@ -329,9 +429,16 @@ def _load_queue():
 
 
 def _save_queue(queue):
+    """Grava a fila de forma atômica (arquivo temporário + os.replace). Uma
+    queda de energia no meio da escrita não pode corromper o JSON e fazer
+    _load_queue descartar TODAS as pendências silenciosamente."""
     os.makedirs(os.path.dirname(_QUEUE_PATH), exist_ok=True)
-    with open(_QUEUE_PATH, 'w') as f:
+    tmp = f"{_QUEUE_PATH}.tmp"
+    with open(tmp, 'w') as f:
         json.dump(queue, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _QUEUE_PATH)
 
 
 def _send_telegram(amount_brl, amount_btc, destination, txid, payment_type):

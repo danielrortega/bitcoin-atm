@@ -165,7 +165,10 @@ def validate_bitcoin_address(address):
     if not isinstance(address, str):
         return False
     addr = address.strip()
-    if not addr:
+    # Endereços Bitcoin reais têm no máximo ~62 chars. Um teto rígido evita que
+    # uma colagem/leitura enorme dispare o decode Base58Check O(n^2) e congele a
+    # thread da GUI (DoS do quiosque). O caminho bech32 já tem seu próprio teto.
+    if not addr or len(addr) > 100:
         return False
     return _valid_segwit_address(addr) or _valid_base58_address(addr)
 
@@ -201,7 +204,7 @@ def validate_lightning_address(address):
     if not isinstance(address, str):
         return False
     addr = address.strip()
-    if not addr or '@' not in addr or any(c.isspace() for c in addr):
+    if not addr or len(addr) > 512 or '@' not in addr or any(c.isspace() for c in addr):
         return False
     return bool(_LN_ADDRESS_RE.match(addr))
 
@@ -245,7 +248,10 @@ def decode_bolt11_amount_msats(invoice):
         digits, factor = amount_part[:-1], _BOLT11_MULTIPLIERS[amount_part[-1]]
     else:
         digits, factor = amount_part, Decimal(1)
-    if not digits.isdigit():
+    # isascii() além de isdigit(): str.isdigit() aceita dígitos Unicode (ex.:
+    # '²', '٣') que Decimal() rejeita com InvalidOperation. Sem isso, uma
+    # invoice maliciosa devolvida por um endpoint LNURL derrubaria a decodificação.
+    if not (digits.isascii() and digits.isdigit()):
         return None
     msats = Decimal(digits) * factor * _MSATS_PER_BTC
     # Com multiplicador 'p', o valor precisa ser múltiplo de 10 pico-BTC para

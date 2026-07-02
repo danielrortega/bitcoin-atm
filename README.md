@@ -404,6 +404,10 @@ export DISPLAY=:0
 python src/main.py
 ```
 
+**A nota inserida não é creditada / valor ignorado**
+- O ATM só aceita denominações reais de cédulas BRL: 2, 5, 10, 20, 50, 100 e 200. Qualquer outro valor lido é tratado como ruído e descartado (veja `Valor de nota inválido ignorado` nos logs).
+- Na POC (noteiro simulado via `socat`), envie o valor como 2 bytes big-endian correspondendo a uma dessas denominações.
+
 **"Porta serial não encontrada" / erro no noteiro**
 - Verifique se o noteiro está conectado: `ls /dev/ttyUSB*`
 - Confirme que o usuário tem permissão: `groups $USER` (deve incluir `dialout`)
@@ -433,7 +437,8 @@ python src/main.py
 
 **Transações na fila não são processadas**
 - As transações offline ficam em `/var/atm/offline_queue.json`
-- Elas são processadas automaticamente em segundo plano quando o ATM inicia com internet disponível
+- Elas são processadas automaticamente em segundo plano na inicialização e reprocessadas a cada 5 minutos enquanto o ATM roda (quando há internet)
+- Cada transação é removida da fila **antes** da tentativa de envio (garantia de no-máximo-uma-vez): em caso de crash/queda de energia durante o envio, o pagamento **não** é retransmitido — confira os logs para reconciliar
 - Para processar manualmente:
   ```bash
   source venv/bin/activate
