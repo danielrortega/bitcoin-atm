@@ -205,6 +205,11 @@ currency = BRL
 # Código da cripto no BTCPay (normalmente BTC, mesmo em testnet)
 crypto_code = BTC
 
+[atm]
+# Teto por transação em BRL. A aceitação de cédulas para quando o total
+# inserido atinge este valor (pode ser excedido por no máximo uma cédula).
+max_transaction_brl = 1000
+
 [hardware]
 # Porta serial do noteiro BV20
 serial_port = /dev/ttyUSB0
@@ -261,7 +266,7 @@ A interface gráfica deve abrir em tela cheia. Para sair, pressione `Alt+F4`.
 
 **Fluxo de teste:**
 1. O ATM exibe a cotação BTC/BRL (atualizada a cada 30 segundos).
-2. Insira uma cédula no noteiro. O valor deve aparecer na tela.
+2. Insira uma ou mais cédulas no noteiro. Os valores **acumulam** e o total aparece na tela (é possível continuar inserindo notas até confirmar o pagamento). A aceitação para ao atingir o teto `max_transaction_brl` do `config.ini`.
 3. Escolha "Enviar On-Chain" ou "Enviar via Lightning".
 4. Apresente o destino:
    - **On-Chain:** aponte o leitor QR para o endereço Bitcoin da sua carteira de teste.

@@ -41,6 +41,20 @@ O padrão usado é `_Worker(_WorkerSignals)` com sinais `result`, `error` e `fin
 
 Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviado, a transação é descartada da fila com um log de erro e o operador deve verificar a carteira no BTCPay Server.
 
+### Aceitação de cédulas
+
+- **Whitelist de denominações**: só valores reais de cédulas BRL (2, 5, 10, 20,
+  50, 100, 200) são creditados; ruído elétrico ou frames concatenados no buffer
+  serial são descartados com log (`atm_gui._parse_note`).
+- **Acúmulo**: múltiplas cédulas somam ao total (`atm_gui._credit_note`), até o
+  momento de confirmar o pagamento — inclusive depois de escolher o método.
+- **Teto por transação** (`max_transaction_brl`): atingido o teto, novas cédulas
+  não são creditadas (logadas em nível crítico para reembolso manual) e a tela
+  orienta o cliente a não inserir mais notas. O teto pode ser excedido por no
+  máximo uma cédula, pois a nota já está dentro da máquina quando o valor é
+  lido — a inibição do noteiro por hardware é o complemento recomendado em
+  produção.
+
 ### Precisão decimal
 
 Conversões BRL→BTC usam `decimal.Decimal` com `ROUND_DOWN` para nunca enviar mais do que o cliente pagou:
@@ -144,6 +158,7 @@ Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/off
 
 | Campo | Seção | Descrição |
 |---|---|---|
+| `max_transaction_brl` | `atm` | Teto por transação em BRL (padrão 1000). A aceitação de cédulas para ao atingi-lo |
 | `host` | `btcpay` | URL completa do BTCPay Server |
 | `store_id` | `btcpay` | ID da loja no BTCPay |
 | `api_token` | `btcpay` | Token Fernet-criptografado |

@@ -99,6 +99,26 @@ def _load_config():
     return cfg
 
 
+_DEFAULT_MAX_TX_BRL = 1000
+
+
+def get_max_transaction_brl():
+    """Teto por transação em BRL ([atm] max_transaction_brl no config.ini).
+    A aceitação de cédulas para quando o total inserido atinge este valor.
+    Com config ausente/inválida, usa um padrão conservador em vez de ficar
+    sem limite."""
+    try:
+        value = int(_load_config()['atm']['max_transaction_brl'])
+        if value > 0:
+            return value
+        logging.warning("max_transaction_brl inválido (%s); usando %s",
+                        value, _DEFAULT_MAX_TX_BRL)
+    except Exception:
+        logging.info("max_transaction_brl não configurado; usando %s",
+                     _DEFAULT_MAX_TX_BRL)
+    return _DEFAULT_MAX_TX_BRL
+
+
 def _get_api_token():
     cfg = _load_config()
     encrypted = cfg['btcpay']['api_token']
