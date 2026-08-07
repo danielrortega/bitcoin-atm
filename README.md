@@ -69,7 +69,7 @@ Se a internet cair durante o processo, a transação é salva em fila e processa
 | Item | Descrição |
 |---|---|
 | Linux Ubuntu 22.04+ | Sistema operacional (AMD64 recomendado) |
-| Python 3.9 ou superior | Já vem instalado na maioria das distribuições Linux |
+| Python 3.10 ou superior | Já vem instalado no Ubuntu 22.04+ (exigido pelo Pillow 12.3) |
 | BTCPay Server | Seu próprio servidor de pagamentos Bitcoin. [Saiba mais](https://btcpayserver.org) |
 | Bot no Telegram (opcional) | Para receber alertas de transações no celular |
 
