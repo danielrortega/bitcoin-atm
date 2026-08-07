@@ -1,13 +1,15 @@
+import logging
 import time
 
 from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QWidget, QMessageBox, QLineEdit)
 from PyQt5.QtCore import QTimer, Qt, QThreadPool, QRunnable, QObject, pyqtSignal
 from PyQt5.QtGui import QFont
-from atm_core import (init_note_reader, get_btc_rate, send_onchain_payment,
-                      send_lightning_payment, print_receipt, enqueue_transaction,
-                      brl_to_btc, PaymentNotBroadcast)
-from utils import is_valid_bitcoin_address, is_valid_lightning_invoice
+from atm_core import (init_note_reader, get_btc_rate, get_max_transaction_brl,
+                      send_onchain_payment, send_lightning_payment,
+                      print_receipt, enqueue_transaction, brl_to_btc,
+                      PaymentNotBroadcast)
+from utils import is_valid_bitcoin_address, is_valid_lightning_destination
 
 
 # --------------------------------------------------------------------------
@@ -62,6 +64,10 @@ def _execute_payment(amount_brl, destination, payment_type, rate, rate_stale):
 
 
 class BTMWindow(QMainWindow):
+    # Denominações válidas das cédulas de real (BRL). Qualquer leitura fora
+    # deste conjunto é tratada como ruído/erro e descartada — nunca creditada.
+    VALID_DENOMINATIONS = frozenset({2, 5, 10, 20, 50, 100, 200})
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bitcoin ATM")
@@ -129,6 +135,7 @@ class BTMWindow(QMainWindow):
 
         # Inicializar variáveis
         self.note_reader = init_note_reader()
+        self.max_transaction_brl = get_max_transaction_brl()
         self.amount_brl = None
         self.start_time = None
         self.rate_start_time = 0
@@ -211,27 +218,84 @@ class BTMWindow(QMainWindow):
     # Leitura de notas
     # ----------------------------------------------------------------------
     def check_note(self):
-        if self._payment_in_flight:
+        # SEMPRE drena o buffer serial primeiro — inclusive durante um pagamento.
+        # Se só drenássemos quando ocioso, os bytes que chegam enquanto o
+        # pagamento roda ficariam no buffer e seriam creditados como uma "nota
+        # fantasma" logo após o reset. A leitura roda dentro de um slot de
+        # QTimer: uma exceção aqui (noteiro desconectado) abortaria o processo
+        # (qFatal do PyQt5) e, com Restart=always, entraria em crash-loop —
+        # por isso é protegida.
+        try:
+            pending = self.note_reader.in_waiting
+            data = self.note_reader.read(pending) if pending > 0 else b''
+        except Exception as e:
+            logging.error("Falha ao ler o noteiro serial: %s", e)
             return
-        if self.note_reader.in_waiting > 0:
-            # Sempre drena o buffer serial para não acumular, mas só aceita
-            # uma nova nota enquanto o cliente ainda está escolhendo o método.
-            # Pulsos espúrios durante o pagamento em andamento são ignorados.
-            data = self.note_reader.read(self.note_reader.in_waiting)
-            note_value = int.from_bytes(data, "big") if data else None
-            if note_value and self.payment_type is None and self.destination is None:
-                self.amount_brl = note_value
-                self.start_time = time.time()
-                self.status_label.setText(f"Nota detectada: R${note_value}")
-                self.instruction_label.setText("Escolha o método de envio")
-                self.onchain_button.setEnabled(True)
-                self.lightning_button.setEnabled(True)
-        elif self.start_time and (time.time() - self.start_time > 30) and not self.destination:
-            self.status_label.setText(f"Nota detectada: R${self.amount_brl} - Cotação atualizada")
+
+        if self._payment_in_flight:
+            return  # buffer já drenado; ignora qualquer entrada durante o envio
+
+        if data:
+            note_value = self._parse_note(data)
+            if note_value:
+                self._credit_note(note_value)
+            return
+
+        if self.start_time and (time.time() - self.start_time > 30) and not self.destination:
+            self.status_label.setText(f"Total inserido: R${self.amount_brl} - Cotação atualizada")
             self.update_rate()
             self.start_time = time.time()
         elif self.destination:
             self.check_qr_input()
+
+    def _credit_note(self, note_value):
+        """Credita uma cédula válida, ACUMULANDO com as anteriores. Cédulas
+        podem ser inseridas a qualquer momento antes de confirmar o pagamento
+        (inclusive depois de escolher o método) — antes, uma segunda cédula
+        sobrescrevia o total ou era silenciosamente descartada.
+
+        Aplica o teto por transação (max_transaction_brl): atingido o teto, a
+        aceitação para e novas cédulas NÃO são creditadas — apenas logadas em
+        nível crítico para reembolso manual pelo operador. O teto pode ser
+        excedido por no máximo uma cédula (a que o cruza), pois a cédula já
+        está fisicamente dentro da máquina quando o valor é lido; o bloqueio
+        por hardware (inibir o noteiro) é o complemento recomendado."""
+        if self.amount_brl and self.amount_brl >= self.max_transaction_brl:
+            logging.critical(
+                "Nota de R$%s recusada: teto de R$%s por transação já atingido "
+                "(total R$%s). REEMBOLSO MANUAL NECESSÁRIO.",
+                note_value, self.max_transaction_brl, self.amount_brl)
+            self.status_label.setText(
+                f"Limite de R${self.max_transaction_brl} atingido — "
+                "não insira mais notas. Procure o operador.")
+            self.status_label.setStyleSheet("color: red;")
+            return
+        self.amount_brl = (self.amount_brl or 0) + note_value
+        self.start_time = time.time()
+        self.status_label.setText(f"Total inserido: R${self.amount_brl}")
+        self.status_label.setStyleSheet("color: black;")
+        if self.payment_type is None:
+            self.instruction_label.setText(
+                "Insira mais notas ou escolha o método de envio")
+            self.onchain_button.setEnabled(True)
+            self.lightning_button.setEnabled(True)
+        if self.amount_brl >= self.max_transaction_brl:
+            self.instruction_label.setText(
+                f"Limite de R${self.max_transaction_brl} atingido — "
+                "escolha o método de envio")
+
+    def _parse_note(self, data):
+        """Interpreta os bytes do noteiro como um valor em BRL e valida contra
+        as denominações reais de cédulas. Rejeita ruído elétrico e frames de
+        duas notas concatenados no buffer — que, com int.from_bytes sobre o
+        buffer inteiro, virariam um valor astronômico. Sem esta whitelist, um
+        glitch poderia creditar R$ milhões e convertê-los em Bitcoin real."""
+        value = int.from_bytes(data, "big")
+        if value in self.VALID_DENOMINATIONS:
+            return value
+        logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
+                        value, data.hex())
+        return None
 
     def _on_address_changed(self, text):
         if self._payment_in_flight:
@@ -241,7 +305,12 @@ class BTMWindow(QMainWindow):
 
     def select_payment(self, payment_type):
         self.payment_type = payment_type
-        self.instruction_label.setText("Escaneie o QR code da sua carteira")
+        if payment_type == "lightning":
+            self.instruction_label.setText(
+                "Escaneie a invoice OU informe seu endereço Lightning "
+                "(ex.: voce@walletofsatoshi.com)")
+        else:
+            self.instruction_label.setText("Escaneie o QR code da sua carteira")
         self.status_label.setText("Aguardando QR code...")
         self.onchain_button.setEnabled(False)
         self.lightning_button.setEnabled(False)
@@ -257,7 +326,7 @@ class BTMWindow(QMainWindow):
             return
         valid = (
             (self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination))
-            or (self.payment_type == "lightning" and is_valid_lightning_invoice(self.destination))
+            or (self.payment_type == "lightning" and is_valid_lightning_destination(self.destination))
         )
         if valid:
             self.status_label.setText(f"Endereço detectado: {self.destination[:10]}...")
@@ -276,12 +345,18 @@ class BTMWindow(QMainWindow):
             if not self.destination:
                 QMessageBox.warning(self, "Atenção", "Insira o endereço de destino.")
             return
+        # Nunca dispara um pagamento sem dinheiro creditado (estado impossível
+        # pelo fluxo normal, mas barato de garantir num caixa com dinheiro real).
+        if not self.amount_brl or self.amount_brl <= 0:
+            QMessageBox.warning(self, "Atenção", "Nenhum valor inserido.")
+            self.reset()
+            return
 
         # Valida o destino (checksum) antes de qualquer envio. Rápido, na GUI.
         if self.payment_type == "onchain":
             valid = is_valid_bitcoin_address(self.destination)
         else:
-            valid = is_valid_lightning_invoice(self.destination)
+            valid = is_valid_lightning_destination(self.destination)
         if not valid:
             QMessageBox.warning(self, "Endereço inválido",
                 "Endereço/invoice inválido para o método escolhido.")

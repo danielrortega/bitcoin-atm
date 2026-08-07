@@ -5,7 +5,8 @@ import qrcode
 import requests
 from PIL import Image
 
-from btc_address import validate_bitcoin_address, validate_lightning_invoice
+from btc_address import (validate_bitcoin_address, validate_lightning_invoice,
+                         validate_lightning_address)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
 
@@ -28,6 +29,19 @@ def is_valid_bitcoin_address(address):
 def is_valid_lightning_invoice(invoice):
     # Validação do checksum bech32 da invoice BOLT11.
     return validate_lightning_invoice(invoice)
+
+
+def is_valid_lightning_address(address):
+    # Validação do formato de Lightning Address (user@domain, LUD-16).
+    return validate_lightning_address(address)
+
+
+def is_valid_lightning_destination(destination):
+    """Aceita os dois formatos de destino Lightning: uma invoice BOLT11
+    (lnbc.../lntb...) ou um Lightning Address (user@domain). O Lightning
+    Address é resolvido para uma invoice no momento do pagamento."""
+    return (validate_lightning_invoice(destination)
+            or validate_lightning_address(destination))
 
 
 def _btcpay_host():

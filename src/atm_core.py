@@ -1,15 +1,21 @@
 import configparser
+import ipaddress
 import json
 import logging
 import os
+import socket
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlparse
 
 import requests
 import serial
 import telegram_send
 from cryptography.fernet import Fernet
 from escpos.printer import Usb
+
+from btc_address import decode_bolt11_amount_msats, validate_lightning_address
 
 _LOG_PATH = '/var/log/btc_atm.log'
 _LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
@@ -24,6 +30,18 @@ _QUEUE_PATH = '/var/atm/offline_queue.json'
 _KEY_PATH = '/etc/atm/key'
 
 _SATOSHI = Decimal('0.00000001')
+_LNURL_TIMEOUT = 15  # segundos para cada chamada HTTP de resolução LNURL-pay
+_LNURL_MAX_BYTES = 65536  # teto do corpo de resposta LNURL (anti-DoS de memória)
+
+# Serializa todo acesso à fila offline. GUI (enqueue) e o worker de background
+# (process_offline_queue) rodam no mesmo processo em threads diferentes; sem
+# este lock, o read-modify-write concorrente perderia transações ou reprocessaria
+# pagamentos (gasto duplo).
+_QUEUE_LOCK = threading.RLock()
+
+# Idade máxima (s) da cotação salva numa transação enfileirada. Acima disso,
+# busca-se uma cotação fresca ao liquidar, para não usar um preço obsoleto.
+_QUEUE_RATE_MAX_AGE = 120
 
 
 class PaymentNotBroadcast(Exception):
@@ -79,6 +97,26 @@ def _load_config():
     cfg = configparser.ConfigParser()
     cfg.read(_CONFIG_PATH)
     return cfg
+
+
+_DEFAULT_MAX_TX_BRL = 1000
+
+
+def get_max_transaction_brl():
+    """Teto por transação em BRL ([atm] max_transaction_brl no config.ini).
+    A aceitação de cédulas para quando o total inserido atinge este valor.
+    Com config ausente/inválida, usa um padrão conservador em vez de ficar
+    sem limite."""
+    try:
+        value = int(_load_config()['atm']['max_transaction_brl'])
+        if value > 0:
+            return value
+        logging.warning("max_transaction_brl inválido (%s); usando %s",
+                        value, _DEFAULT_MAX_TX_BRL)
+    except Exception:
+        logging.info("max_transaction_brl não configurado; usando %s",
+                     _DEFAULT_MAX_TX_BRL)
+    return _DEFAULT_MAX_TX_BRL
 
 
 def _get_api_token():
@@ -152,12 +190,134 @@ def send_onchain_payment(amount_brl, address, rate):
     return txid
 
 
-def send_lightning_payment(amount_brl, invoice, rate):
+def _resolve_lightning_address(address, amount_btc):
+    """Resolve um Lightning Address (user@domain) em uma invoice BOLT11 para
+    o valor exato (LUD-16 / LNURL-pay), em duas chamadas HTTP:
+
+      1. GET https://domain/.well-known/lnurlp/user  → metadados (callback,
+         minSendable/maxSendable em msat)
+      2. GET <callback>?amount=<msats>               → { "pr": "lntb..." }
+
+    Toda a resolução acontece ANTES de qualquer chamada de pagamento ao
+    BTCPay, então qualquer falha aqui é PaymentNotBroadcast (nada foi enviado
+    → seguro reenfileirar). Verifica também se a invoice retornada tem
+    exatamente o valor solicitado, protegendo o cliente contra um endpoint
+    que devolva um valor diferente."""
+    user, domain = address.split('@', 1)
+    # Onion pode usar http puro (via Tor); clearnet exige https (LUD-16).
+    scheme = 'http' if domain.lower().endswith('.onion') else 'https'
+    lnurl_url = f"{scheme}://{domain}/.well-known/lnurlp/{user}"
+
+    # Valor solicitado em millisatoshis (amount_btc já está em múltiplos de sat).
+    sats = int((amount_btc / _SATOSHI).to_integral_value())
+    msats = sats * 1000
+    if msats <= 0:
+        raise PaymentNotBroadcast(f"valor muito baixo para Lightning: {amount_btc} BTC")
+
+    meta = _lnurl_get_json(lnurl_url, f"resolver {address}")
+    if meta.get('tag') != 'payRequest' or 'callback' not in meta:
+        raise PaymentNotBroadcast(f"{address} não é um endereço LNURL-pay válido")
+    try:
+        min_s = int(meta.get('minSendable', 0))
+        max_s = int(meta.get('maxSendable', 0))
+    except (TypeError, ValueError) as e:
+        raise PaymentNotBroadcast(f"limites LNURL inválidos para {address}: {e}") from e
+    if not (min_s <= msats <= max_s):
+        raise PaymentNotBroadcast(
+            f"valor {msats} msat fora do permitido [{min_s}, {max_s}] por {address}")
+
+    callback = meta['callback']
+    sep = '&' if '?' in callback else '?'
+    data = _lnurl_get_json(f"{callback}{sep}amount={msats}", f"obter invoice de {address}")
+    if data.get('status') == 'ERROR':
+        raise PaymentNotBroadcast(f"LNURL recusou: {data.get('reason', data)}")
+    invoice = data.get('pr')
+    if not invoice:
+        raise PaymentNotBroadcast(f"LNURL não retornou invoice para {address}: {data}")
+
+    # Segurança: a invoice precisa ter exatamente o valor solicitado.
+    got = decode_bolt11_amount_msats(invoice)
+    if got != msats:
+        raise PaymentNotBroadcast(
+            f"invoice de {address} com valor inesperado "
+            f"(esperado {msats} msat, obtido {got})")
+    logging.info("Lightning address %s resolvido para invoice de %s msat", address, msats)
+    return invoice
+
+
+def _assert_safe_lnurl_url(url):
+    """Defesa anti-SSRF: o domínio e a URL de callback do LNURL vêm do cliente
+    (e de um servidor que ele controla). Sem esta checagem, um cliente hostil
+    poderia fazer o ATM emitir requisições a serviços internos (localhost, RPC
+    do bitcoind, metadados de nuvem em 169.254.169.254 etc.).
+
+    Exige https (http só para .onion), e para clearnet resolve o host e recusa
+    qualquer IP privado/loopback/link-local/reservado. Resta um TOCTOU teórico
+    (DNS rebinding entre esta resolução e a do requests); o bloqueio de
+    redirects em _lnurl_get_json reduz a superfície restante."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise PaymentNotBroadcast(f"URL LNURL inválida: {url}")
+    is_onion = host.lower().endswith('.onion')
+    if parsed.scheme == 'https' or (parsed.scheme == 'http' and is_onion):
+        pass
+    else:
+        raise PaymentNotBroadcast(f"esquema LNURL não permitido: {parsed.scheme}")
+    if is_onion:
+        return  # resolvido pelo Tor; não há IP local para inspecionar
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise PaymentNotBroadcast(f"não foi possível resolver {host}: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise PaymentNotBroadcast(
+                f"host LNURL {host} aponta para endereço interno ({ip}) — bloqueado")
+
+
+def _lnurl_get_json(url, context):
+    """GET HTTP que retorna JSON, classificando falhas como PaymentNotBroadcast
+    (a resolução ocorre antes do pagamento, então nada foi transmitido).
+    Bloqueia alvos internos (anti-SSRF), não segue redirects (um redirect para
+    um host interno driblaria a checagem) e limita o tamanho do corpo."""
+    _assert_safe_lnurl_url(url)
+    try:
+        resp = requests.get(url, timeout=_LNURL_TIMEOUT,
+                            allow_redirects=False, stream=True)
+    except requests.RequestException as e:
+        raise PaymentNotBroadcast(f"falha de rede ao {context}: {e}") from e
+    try:
+        if resp.status_code in (301, 302, 303, 307, 308):
+            raise PaymentNotBroadcast(f"redirect não permitido ao {context}")
+        if resp.status_code != 200:
+            raise PaymentNotBroadcast(f"falha ao {context}: HTTP {resp.status_code}")
+        raw = resp.raw.read(_LNURL_MAX_BYTES + 1, decode_content=True)
+        if len(raw) > _LNURL_MAX_BYTES:
+            raise PaymentNotBroadcast(f"resposta LNURL grande demais ao {context}")
+    finally:
+        resp.close()
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise PaymentNotBroadcast(f"resposta inválida ao {context}: {e}") from e
+
+
+def send_lightning_payment(amount_brl, destination, rate):
     cfg = _load_config()
     host = cfg['btcpay']['host'].rstrip('/')
     store_id = cfg['btcpay']['store_id']
     crypto = cfg['btcpay'].get('crypto_code', 'BTC')
     amount_btc = brl_to_btc(amount_brl, rate)
+    # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
+    # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
+    if validate_lightning_address(destination):
+        invoice = _resolve_lightning_address(destination, amount_btc)
+    else:
+        invoice = destination
     url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
     payload = {'BOLT11': invoice}
     resp = _post_payment(url, payload)
@@ -176,7 +336,8 @@ def send_lightning_payment(amount_brl, invoice, rate):
     # 'Pending' é tratado como enviado: a invoice é de uso único, então um
     # reenvio do mesmo BOLT11 não causa pagamento duplicado.
     logging.info("Lightning payment: %s BTC status=%s hash=%s", amount_btc, status, payment_hash)
-    _send_telegram(amount_brl, amount_btc, invoice, payment_hash, 'lightning')
+    # Registra o destino original (endereço ou invoice) para o operador.
+    _send_telegram(amount_brl, amount_btc, destination, payment_hash, 'lightning')
     return payment_hash
 
 
@@ -198,44 +359,83 @@ def print_receipt(amount_brl, amount_btc, destination, txid):
 
 
 def enqueue_transaction(amount_brl, destination, payment_type, rate):
-    queue = _load_queue()
-    queue.append({
-        'amount_brl': amount_brl,
-        'destination': destination,
-        'payment_type': payment_type,
-        'rate': rate,
-        'timestamp': time.time(),
-    })
-    _save_queue(queue)
+    with _QUEUE_LOCK:
+        queue = _load_queue()
+        queue.append({
+            'amount_brl': amount_brl,
+            'destination': destination,
+            'payment_type': payment_type,
+            'rate': rate,
+            'timestamp': time.time(),
+        })
+        _save_queue(queue)
     logging.info("Transaction enqueued: %s BRL to %s (%s)", amount_brl, destination, payment_type)
 
 
+def _fresh_rate_for(tx):
+    """Só reaproveita a cotação salva se ela for recente; caso contrário busca
+    uma fresca. Impede liquidar horas/dias depois com um preço obsoleto (que,
+    se menor que o atual, faria o ATM enviar BTC a mais)."""
+    stored = tx.get('rate')
+    age = time.time() - tx.get('timestamp', 0)
+    if stored and age <= _QUEUE_RATE_MAX_AGE:
+        return stored
+    return get_btc_rate()
+
+
 def process_offline_queue():
-    queue = _load_queue()
-    if not queue:
-        return
-    remaining = []
-    for tx in queue:
+    """Processa a fila offline com garantia de NO-MÁXIMO-UMA-VEZ por transação.
+
+    Cada transação é REMOVIDA da fila persistida ANTES da tentativa de envio.
+    Assim, um crash/queda de energia durante o envio não faz o pagamento ser
+    retransmitido no próximo processamento — preferimos, no pior caso, perder
+    o registro (reconciliável pelos logs) a arriscar um gasto duplo. Só uma
+    falha comprovadamente-não-transmitida (PaymentNotBroadcast) recoloca a
+    transação na fila."""
+    while True:
+        with _QUEUE_LOCK:
+            queue = _load_queue()
+            if not queue:
+                return
+            tx = queue.pop(0)
+            _save_queue(queue)  # a partir daqui, tx não está mais persistida
+
         try:
-            rate = tx.get('rate') or get_btc_rate()
+            rate = _fresh_rate_for(tx)
             if not rate:
-                remaining.append(tx)
-                continue
+                # Sem cotação: nada foi enviado → seguro reenfileirar. Para de
+                # processar (as demais provavelmente falhariam igual); tenta de
+                # novo no próximo ciclo.
+                _requeue(tx)
+                logging.warning("Sem cotação para processar a fila; adiada.")
+                return
             if tx['payment_type'] == 'onchain':
                 txid = send_onchain_payment(tx['amount_brl'], tx['destination'], rate)
             else:
                 txid = send_lightning_payment(tx['amount_brl'], tx['destination'], rate)
+            # Daqui em diante o dinheiro saiu: NADA pode reenfileirar esta tx.
             amount_btc = brl_to_btc(tx['amount_brl'], rate)
             print_receipt(tx['amount_brl'], amount_btc, tx['destination'], txid)
             logging.info("Offline queue tx processed: %s", txid)
+        except PaymentNotBroadcast as e:
+            # Comprovadamente não transmitido → seguro recolocar na fila.
+            logging.warning("Queued tx not broadcast, re-queued: %s", e)
+            _requeue(tx)
         except PaymentUncertain as e:
-            # Resultado ambíguo: não recoloca na fila para não arriscar
-            # gasto duplo num reprocessamento futuro. Operador deve conferir.
+            # Ambíguo (já removida da fila): NÃO reenfileira, para não arriscar
+            # gasto duplo. Operador confere a carteira.
             logging.error("Queued tx UNCERTAIN, dropped to avoid double-spend: %s", e)
         except Exception as e:
-            logging.error("Failed to process queued tx: %s", e)
-            remaining.append(tx)
-    _save_queue(remaining)
+            # Erro inesperado após um possível envio (já removida): não
+            # reenfileira. Registra para reconciliação manual.
+            logging.error("Queued tx failed post-removal, NOT re-queued: %s", e)
+
+
+def _requeue(tx):
+    with _QUEUE_LOCK:
+        queue = _load_queue()
+        queue.append(tx)
+        _save_queue(queue)
 
 
 def _load_queue():
@@ -249,9 +449,16 @@ def _load_queue():
 
 
 def _save_queue(queue):
+    """Grava a fila de forma atômica (arquivo temporário + os.replace). Uma
+    queda de energia no meio da escrita não pode corromper o JSON e fazer
+    _load_queue descartar TODAS as pendências silenciosamente."""
     os.makedirs(os.path.dirname(_QUEUE_PATH), exist_ok=True)
-    with open(_QUEUE_PATH, 'w') as f:
+    tmp = f"{_QUEUE_PATH}.tmp"
+    with open(tmp, 'w') as f:
         json.dump(queue, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _QUEUE_PATH)
 
 
 def _send_telegram(amount_brl, amount_btc, destination, txid, payment_type):
