@@ -61,8 +61,14 @@ if __name__ == "__main__":
             _workers.discard(worker)
             _flush_in_flight['v'] = False
         worker.signals.finished.connect(_done)
-        # Reaproveita o QThreadPool já criado pela janela.
-        window.threadpool.start(worker)
+        try:
+            # Reaproveita o QThreadPool já criado pela janela.
+            window.threadpool.start(worker)
+        except Exception as e:
+            # Se o worker nunca chega a rodar, 'finished' nunca é emitido e a
+            # flag ficaria travada, bloqueando todos os retries seguintes.
+            _done()
+            logging.error("Não foi possível agendar o flush da fila: %s", e)
 
     # Dispara após o loop de eventos iniciar, com a janela já visível, para
     # que a interface apareça imediatamente sem esperar a rede.
