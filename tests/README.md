@@ -1,0 +1,56 @@
+# Testes
+
+Rodar a suíte inteira, a partir da raiz do repositório:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Um módulo só, ou um teste só:
+
+```bash
+python -m unittest discover -s tests -p test_notes.py
+python -m unittest discover -s tests -k test_teto_recusa_cedula_seguinte
+```
+
+Nada além da biblioteca padrão é necessário. As dependências de hardware
+(PyQt5, pyserial, escpos, telegram-send, qrcode) recebem stubs em
+`support.py` **só quando não estão instaladas** — no Raspberry Pi, com o
+`venv` completo, os módulos reais são usados. Nenhum teste abre porta serial,
+impressora, janela ou conexão de rede.
+
+## Falhas esperadas
+
+A saída normal hoje é:
+
+```
+OK (expected failures=11)
+```
+
+Cada `@unittest.expectedFailure` documenta um bug conhecido, com a correção
+prevista no docstring da classe:
+
+| Testes | Achado |
+|---|---|
+| `test_payments.TestErroAntesDoBroadcast`<br>`test_gui_resultado.TestErroDeConfiguracaoNaGui` | Erro antes do POST (config, chave Fernet) escapa como exceção crua e é tratado como "incerto": a transação não é enfileirada nem reenfileirada, e o dinheiro do cliente se perde. |
+| `test_notes.TestFramePartido` | Quadro de cédula partido entre dois polls de 1s é descartado pelas duas metades: a nota está na máquina e nada é creditado. |
+| `test_notes.TestNotaEngolidaDuranteOPagamento` | Cédula inserida durante o envio é descartada sem nenhum registro para reembolso. |
+| `test_gui_resultado.TestRegistroParaReconciliacao` | Falha incerta e falha de enfileiramento só produzem uma caixa de diálogo; não há log com valor e destino para reconciliar. |
+| `test_offline_queue.TestRetentativaInfinita` | Transação que falha de forma determinística é retentada a cada 5 minutos para sempre, sem contador de tentativas nem fila de descarte. |
+
+**Ao corrigir um desses bugs, remova o `@unittest.expectedFailure`.** Se
+esquecer, o `unittest` reporta `UNEXPECTED SUCCESS` e o run termina com código
+de saída 1 — a correção não passa despercebida.
+
+## Convenção
+
+Testes que fixam uma decisão em aberto (e não um acerto) dizem isso no
+docstring — por exemplo `TestRedeNaoAmarradaAConfig`, que registra que
+endereços de testnet são aceitos num ATM de mainnet porque a validação não
+conhece a rede configurada. Ao amarrar a rede ao `config.ini`, esse teste
+muda de propósito, não por acidente.
+
+Vetores de endereço e invoice são **gerados** por codificadores de referência
+em `support.py` (Base58Check e bech32, escritos a partir do BIP-173), nunca
+digitados de memória: um checksum errado faz o teste "provar" uma rejeição que
+o código não deveria estar fazendo.
