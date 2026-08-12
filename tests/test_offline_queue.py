@@ -10,6 +10,7 @@ refactor — e cara de descobrir em produção.
 """
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -28,9 +29,14 @@ class BaseFila(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.queue_path = os.path.join(self.dir, 'atm', 'offline_queue.json')
-        p = mock.patch.object(atm_core, '_QUEUE_PATH', self.queue_path)
-        p.start()
-        self.addCleanup(p.stop)
+        self.failed_path = os.path.join(self.dir, 'atm', 'failed_queue.json')
+        # Os DOIS caminhos precisam apontar para o diretório temporário: sem
+        # isso a suíte escreve em /var/atm do sistema ao exercitar o descarte.
+        for alvo, valor in (('_QUEUE_PATH', self.queue_path),
+                            ('_FAILED_QUEUE_PATH', self.failed_path)):
+            p = mock.patch.object(atm_core, alvo, valor)
+            p.start()
+            self.addCleanup(p.stop)
 
         self.enviados = []
         self.recibos = []
@@ -54,9 +60,15 @@ class BaseFila(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def ler_fila(self):
-        if not os.path.exists(self.queue_path):
+        return self._ler(self.queue_path)
+
+    def ler_descartadas(self):
+        return self._ler(self.failed_path)
+
+    def _ler(self, path):
+        if not os.path.exists(path):
             return []
-        with open(self.queue_path) as f:
+        with open(path) as f:
             return json.load(f)
 
     def escrever_fila(self, itens):
@@ -237,25 +249,129 @@ class TestCotacao(BaseFila):
         self.assertEqual(self.enviados[0][2], 500000.0)
 
 
-class TestRetentativaInfinita(BaseFila):
-    """ACHADO 5 DA REVISÃO — falha esperada até a correção.
+class TestLimiteDeTentativas(BaseFila):
+    """Contador de tentativas e fila de descarte.
 
-    Uma transação que falha de forma determinística (endereço que o BTCPay
-    rejeita com 4xx) volta para a fila em toda passagem, a cada 5 minutos,
-    para sempre. Não há contador de tentativas nem fila de descarte, então
-    ninguém é avisado e o cliente nunca é reembolsado.
+    Antes, uma transação que falha de forma determinística (endereço que o
+    BTCPay rejeita com 4xx) voltava para a fila em toda passagem, a cada 5
+    minutos, para sempre: ninguém era avisado e o cliente nunca era
+    reembolsado.
 
-    Correção prevista: contar tentativas na própria transação e, ao estourar o
-    limite, mover para uma fila de descarte com log crítico."""
+    O contador só avança quando houve tentativa REAL de envio. Uma queda do
+    BTCPay não queima as tentativas de transações válidas: is_online() barra o
+    processamento quando o host não responde, e a falta de cotação reenfileira
+    sem tentar."""
 
-    @unittest.expectedFailure
-    def test_desiste_depois_de_algumas_tentativas(self):
-        self.instalar_envio(onchain=lambda a, d, r: (_ for _ in ()).throw(
-            atm_core.PaymentNotBroadcast('rejeitado 400: endereço inválido')))
+    def rejeitar_sempre(self):
+        self.instalar_envio(onchain=self.falha_permanente)
+
+    def falha_permanente(self, amount, dest, rate):
+        self.enviados.append((amount, dest, rate))
+        raise atm_core.PaymentNotBroadcast('rejeitado 400: endereço inválido')
+
+    def test_contador_avanca_a_cada_tentativa(self):
+        self.rejeitar_sempre()
         self.escrever_fila([self.tx()])
-        for _ in range(10):
+        for esperado in (1, 2, 3):
+            atm_core.process_offline_queue()
+            self.assertEqual(self.ler_fila()[0]['attempts'], esperado)
+
+    def test_desiste_no_teto_e_sai_da_fila(self):
+        self.rejeitar_sempre()
+        self.escrever_fila([self.tx()])
+        for _ in range(atm_core._MAX_QUEUE_ATTEMPTS):
             atm_core.process_offline_queue()
         self.assertEqual(self.ler_fila(), [])
+        self.assertEqual(len(self.enviados), atm_core._MAX_QUEUE_ATTEMPTS)
+
+    def test_nao_martela_o_btcpay_depois_de_desistir(self):
+        """O ponto do achado: sem o teto, o ciclo de 5 min tentaria para sempre."""
+        self.rejeitar_sempre()
+        self.escrever_fila([self.tx()])
+        for _ in range(atm_core._MAX_QUEUE_ATTEMPTS + 20):
+            atm_core.process_offline_queue()
+        self.assertEqual(len(self.enviados), atm_core._MAX_QUEUE_ATTEMPTS)
+
+    def test_transacao_descartada_e_preservada_com_o_motivo(self):
+        """Descartar da fila não é jogar fora: é dinheiro parado esperando uma
+        pessoa, e o registro precisa bastar para reembolsar ou reenviar."""
+        self.rejeitar_sempre()
+        self.escrever_fila([self.tx(amount=150)])
+        for _ in range(atm_core._MAX_QUEUE_ATTEMPTS):
+            atm_core.process_offline_queue()
+        (descartada,) = self.ler_descartadas()
+        self.assertEqual(descartada['amount_brl'], 150)
+        self.assertEqual(descartada['destination'], DESTINO)
+        self.assertEqual(descartada['payment_type'], 'onchain')
+        self.assertEqual(descartada['attempts'], atm_core._MAX_QUEUE_ATTEMPTS)
+        self.assertIn('400', descartada['last_error'])
+        self.assertAlmostEqual(descartada['failed_at'], time.time(), delta=10)
+
+    def test_desistencia_gera_log_critico(self):
+        self.rejeitar_sempre()
+        self.escrever_fila([self.tx(amount=150)])
+        for _ in range(atm_core._MAX_QUEUE_ATTEMPTS - 1):
+            atm_core.process_offline_queue()
+        with self.assertLogs(level=logging.CRITICAL) as cm:
+            atm_core.process_offline_queue()
+        registro = ' '.join(cm.output)
+        self.assertIn('150', registro)
+        self.assertIn(DESTINO, registro)
+
+    def test_sucesso_antes_do_teto_nao_descarta(self):
+        """Falhas transitórias não podem condenar uma transação boa."""
+        tentativas = {'n': 0}
+
+        def falha_algumas_vezes(amount, dest, rate):
+            tentativas['n'] += 1
+            if tentativas['n'] < 3:
+                raise atm_core.PaymentNotBroadcast('sem conexão')
+            return 'txid-ok'
+
+        self.instalar_envio(onchain=falha_algumas_vezes)
+        self.escrever_fila([self.tx()])
+        for _ in range(3):
+            atm_core.process_offline_queue()
+        self.assertEqual(self.ler_fila(), [])
+        self.assertEqual(self.ler_descartadas(), [])
+
+    def test_falta_de_cotacao_nao_consome_tentativa(self):
+        """Sem cotação nada é enviado, então não houve tentativa: uma queda
+        prolongada do BTCPay não pode esgotar o contador."""
+        self.rejeitar_sempre()
+        self.get_rate.return_value = None
+        self.escrever_fila([self.tx(rate=None)])
+        for _ in range(atm_core._MAX_QUEUE_ATTEMPTS + 5):
+            atm_core.process_offline_queue()
+        self.assertEqual(self.enviados, [])
+        self.assertEqual(self.ler_descartadas(), [])
+        self.assertNotIn('attempts', self.ler_fila()[0])
+
+    def test_transacao_antiga_sem_o_campo_attempts(self):
+        """Uma fila gravada por uma versão anterior não tem o campo; ela não
+        pode quebrar nem ser descartada na primeira falha."""
+        antiga = self.tx()
+        antiga.pop('attempts', None)
+        self.rejeitar_sempre()
+        self.escrever_fila([antiga])
+        atm_core.process_offline_queue()
+        self.assertEqual(self.ler_fila()[0]['attempts'], 1)
+
+    def test_uma_desistencia_nao_afeta_as_outras_transacoes(self):
+        ruim, boa = self.tx(amount=10), self.tx(amount=20)
+        ruim['attempts'] = atm_core._MAX_QUEUE_ATTEMPTS - 1
+
+        def por_valor(amount, dest, rate):
+            self.enviados.append((amount, dest, rate))
+            if amount == 10:
+                raise atm_core.PaymentNotBroadcast('rejeitado 400')
+            return 'txid-ok'
+
+        self.instalar_envio(onchain=por_valor)
+        self.escrever_fila([ruim, boa])
+        atm_core.process_offline_queue()
+        self.assertEqual(self.ler_fila(), [])
+        self.assertEqual([t['amount_brl'] for t in self.ler_descartadas()], [10])
 
 
 if __name__ == '__main__':

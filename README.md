@@ -444,6 +444,7 @@ python src/main.py
 - As transações offline ficam em `/var/atm/offline_queue.json`
 - Elas são processadas automaticamente em segundo plano na inicialização e reprocessadas a cada 5 minutos enquanto o ATM roda (quando há internet)
 - Cada transação é removida da fila **antes** da tentativa de envio (garantia de no-máximo-uma-vez): em caso de crash/queda de energia durante o envio, o pagamento **não** é retransmitido — confira os logs para reconciliar
+- Depois de 10 tentativas de envio recusadas (por exemplo, um endereço que o BTCPay rejeita), a transação sai da fila e vai para `/var/atm/failed_queue.json`, com o motivo, e um alerta `CRITICAL` aparece no log. **Isso exige ação sua**: reembolsar o cliente ou corrigir o destino e reprocessar
 - Para processar manualmente:
   ```bash
   source venv/bin/activate

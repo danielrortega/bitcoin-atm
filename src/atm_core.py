@@ -28,6 +28,7 @@ except (PermissionError, FileNotFoundError, OSError):
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
 _QUEUE_PATH = '/var/atm/offline_queue.json'
+_FAILED_QUEUE_PATH = '/var/atm/failed_queue.json'
 _KEY_PATH = '/etc/atm/key'
 
 _SATOSHI = Decimal('0.00000001')
@@ -43,6 +44,18 @@ _QUEUE_LOCK = threading.RLock()
 # Idade máxima (s) da cotação salva numa transação enfileirada. Acima disso,
 # busca-se uma cotação fresca ao liquidar, para não usar um preço obsoleto.
 _QUEUE_RATE_MAX_AGE = 120
+
+# Quantas tentativas de ENVIO uma transação enfileirada faz antes de ir para a
+# fila de descarte. Sem este teto, uma transação que falha de forma
+# determinística (endereço que o BTCPay rejeita com 4xx) voltava para a fila a
+# cada ciclo, para sempre: ninguém era avisado e o cliente nunca era
+# reembolsado.
+#
+# Só conta tentativa de fato feita. Uma queda do BTCPay não queima o contador:
+# is_online() barra o processamento quando o host não responde, e a falta de
+# cotação reenfileira sem tentar enviar. Com o ciclo de 5 min, o teto equivale
+# a ~50 minutos de rejeições seguidas com o servidor no ar.
+_MAX_QUEUE_ATTEMPTS = 10
 
 
 class PaymentNotBroadcast(Exception):
@@ -457,9 +470,16 @@ def process_offline_queue():
             print_receipt(tx['amount_brl'], amount_btc, tx['destination'], txid)
             logging.info("Offline queue tx processed: %s", txid)
         except PaymentNotBroadcast as e:
-            # Comprovadamente não transmitido → seguro recolocar na fila.
-            logging.warning("Queued tx not broadcast, re-queued: %s", e)
-            _requeue(tx)
+            # Comprovadamente não transmitido → seguro recolocar na fila, até
+            # o teto de tentativas.
+            tx['attempts'] = tx.get('attempts', 0) + 1
+            if tx['attempts'] >= _MAX_QUEUE_ATTEMPTS:
+                _dead_letter(tx, e)
+            else:
+                logging.warning("Queued tx not broadcast (tentativa %s/%s), "
+                                "re-queued: %s", tx['attempts'],
+                                _MAX_QUEUE_ATTEMPTS, e)
+                _requeue(tx)
         except PaymentUncertain as e:
             # Ambíguo (já removida da fila): NÃO reenfileira, para não arriscar
             # gasto duplo. Operador confere a carteira.
@@ -477,27 +497,52 @@ def _requeue(tx):
         _save_queue(queue)
 
 
-def _load_queue():
-    if not os.path.exists(_QUEUE_PATH):
+def _dead_letter(tx, error):
+    """Tira da fila principal uma transação que esgotou as tentativas e a
+    guarda em _FAILED_QUEUE_PATH.
+
+    Não é descarte: é dinheiro parado esperando uma pessoa. A transação sai do
+    laço de retry (que ficaria martelando o BTCPay indefinidamente) mas o
+    registro é preservado com o motivo, para o operador reembolsar o cliente
+    ou corrigir o destino e reprocessar manualmente."""
+    tx['failed_at'] = time.time()
+    tx['last_error'] = str(error)
+    with _QUEUE_LOCK:
+        failed = _load_queue(_FAILED_QUEUE_PATH)
+        failed.append(tx)
+        _save_queue(failed, _FAILED_QUEUE_PATH)
+    logging.critical(
+        "TRANSAÇÃO DESISTIDA após %s tentativas: R$%s para %s (%s). Movida "
+        "para %s. AÇÃO MANUAL NECESSÁRIA (reembolso ou reenvio). Último erro: %s",
+        tx['attempts'], tx.get('amount_brl'), tx.get('destination'),
+        tx.get('payment_type'), _FAILED_QUEUE_PATH, error)
+
+
+def _load_queue(path=None):
+    # O caminho é lido em tempo de chamada (e não como default do parâmetro)
+    # para que continue valendo se o módulo for reconfigurado.
+    path = path or _QUEUE_PATH
+    if not os.path.exists(path):
         return []
     try:
-        with open(_QUEUE_PATH, 'r') as f:
+        with open(path, 'r') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return []
 
 
-def _save_queue(queue):
+def _save_queue(queue, path=None):
     """Grava a fila de forma atômica (arquivo temporário + os.replace). Uma
     queda de energia no meio da escrita não pode corromper o JSON e fazer
     _load_queue descartar TODAS as pendências silenciosamente."""
-    os.makedirs(os.path.dirname(_QUEUE_PATH), exist_ok=True)
-    tmp = f"{_QUEUE_PATH}.tmp"
+    path = path or _QUEUE_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
     with open(tmp, 'w') as f:
         json.dump(queue, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, _QUEUE_PATH)
+    os.replace(tmp, path)
 
 
 def _send_telegram(amount_brl, amount_btc, destination, txid, payment_type):

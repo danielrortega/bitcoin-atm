@@ -24,21 +24,24 @@ impressora, janela ou conexão de rede.
 A saída normal hoje é:
 
 ```
-OK (expected failures=1)
+OK
 ```
 
-Cada `@unittest.expectedFailure` documenta um bug conhecido, com a correção
-prevista no docstring da classe:
+Não há nenhuma falha esperada no momento: os cinco achados da revisão que
+originaram esta suíte foram corrigidos.
 
-| Testes | Achado |
-|---|---|
-| `test_offline_queue.TestRetentativaInfinita` | Transação que falha de forma determinística é retentada a cada 5 minutos para sempre, sem contador de tentativas nem fila de descarte. |
+## Como um bug conhecido entra aqui
 
-**Ao corrigir um desses bugs, remova o `@unittest.expectedFailure`.** Se
-esquecer, o `unittest` reporta `UNEXPECTED SUCCESS` e o run termina com código
-de saída 1 — a correção não passa despercebida.
+Um defeito encontrado mas ainda não corrigido vira um teste marcado com
+`@unittest.expectedFailure`, com a correção prevista no docstring da classe.
+A suíte segue verde e o bug fica documentado de forma executável, não em
+comentário.
 
-Já corrigidos por este caminho:
+**Ao corrigir, remova o marcador.** Se esquecer, o `unittest` reporta
+`UNEXPECTED SUCCESS` e o run termina com código de saída 1 — a correção não
+passa despercebida.
+
+Corrigidos por este caminho:
 
 - **Erro antes do POST** (config ilegível, chave Fernet ausente ou rotacionada)
   escapava como exceção crua e era tratado como resultado ambíguo, então a
@@ -59,6 +62,12 @@ Já corrigidos por este caminho:
   `test_notes.TestNotaDuranteOPagamento` e
   `test_gui_resultado.TestRegistroParaReconciliacao`, que também fixa o outro
   lado: desfecho normal NÃO gera `CRITICAL`, para o nível não virar ruído.
+- **Transação que falha sempre** voltava para a fila a cada 5 minutos,
+  indefinidamente. Hoje cada item conta tentativas de envio e, no teto, vai
+  para a fila de descarte com log crítico — ver
+  `test_offline_queue.TestLimiteDeTentativas`, que fixa também o que NÃO pode
+  consumir tentativa (falta de cotação) e a compatibilidade com filas gravadas
+  antes do campo existir.
 
 ## Convenção
 

@@ -167,6 +167,29 @@ Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/off
 
 `is_online()` verifica conectividade fazendo `HEAD` no host do BTCPay configurado — não usa servidores externos (compatível com ambientes Tor).
 
+### Limite de tentativas e fila de descarte
+
+Cada transação carrega um contador `attempts`, incrementado só quando houve
+tentativa real de envio que falhou com `PaymentNotBroadcast`. Ao atingir
+`_MAX_QUEUE_ATTEMPTS` (10), ela sai da fila principal e vai para
+`/var/atm/failed_queue.json`, com `failed_at` e `last_error`, acompanhada de um
+log `CRITICAL`.
+
+Sem esse teto, uma transação que falha de forma determinística — o caso típico
+é um endereço que o BTCPay rejeita com 4xx — voltava para a fila a cada ciclo
+de 5 minutos, indefinidamente: o servidor era martelado, ninguém era avisado e
+o cliente nunca era reembolsado.
+
+O contador não é queimado por indisponibilidade: com o BTCPay fora do ar,
+`is_online()` impede o processamento, e sem cotação a transação é reenfileirada
+sem tentativa de envio. Só rejeições com o servidor no ar consomem tentativas —
+o teto equivale a ~50 minutos delas.
+
+A fila de descarte **não é lixo**: é dinheiro parado esperando uma pessoa. O
+operador reembolsa o cliente ou corrige o destino e reprocessa manualmente
+(mover a entrada de volta para `offline_queue.json`, sem os campos `attempts`,
+`failed_at` e `last_error`).
+
 ---
 
 ## Configuração (`config.ini`)
@@ -200,7 +223,7 @@ sudo journalctl -u bitcoin-atm -f
 ### Nível CRÍTICO = dinheiro parado esperando uma pessoa
 
 Todo registro `CRITICAL` significa que um cliente pode ter ficado sem o que
-pagou, e nenhum deles se resolve sozinho. São só quatro situações, todas com
+pagou, e nenhum deles se resolve sozinho. São só cinco situações, todas com
 valor e destino na própria mensagem, porque a caixa de diálogo na tela some no
 cliente seguinte:
 
@@ -211,6 +234,8 @@ CRITICAL Pagamento com resultado INCERTO: R$150 para bc1q... (onchain). Confira
          a carteira no BTCPay ANTES de reenviar (risco de gasto duplo). ...
 CRITICAL TRANSAÇÃO PERDIDA: R$150 para bc1q... (onchain) não foi enviada nem
          enfileirada. Envio: ... | Enfileiramento: ...
+CRITICAL TRANSAÇÃO DESISTIDA após 10 tentativas: R$150 para bc1q... (onchain).
+         Movida para /var/atm/failed_queue.json. AÇÃO MANUAL NECESSÁRIA ...
 ```
 
 Vale a pena alertar sobre esse nível (por exemplo, `journalctl -p crit`).
