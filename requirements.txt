@@ -2,6 +2,11 @@ PyQt5==5.15.11
 cryptography==50.0.0
 pyserial==3.5
 requests==2.34.2
+# Nenhum código do ATM importa qrcode nem PIL diretamente (o leitor de QR é um
+# teclado USB, não há geração de imagem). Os dois pins são deliberados e devem
+# ficar: qrcode é dependência transitiva do python-escpos, e pillow foi fixado
+# nesta versão para fechar vulnerabilidades conhecidas. Remover as linhas não
+# desinstala nada — só troca versões auditadas por indeterminadas.
 qrcode==8.2
 pillow==12.3.0
 python-escpos==3.1
