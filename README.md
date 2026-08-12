@@ -224,11 +224,10 @@ baud_rate = 9600
 
 # ID USB da impressora no formato vendor:product (veja `lsusb`)
 printer_usb = 0416:5011
-
-[telegram]
-# ID do chat para receber alertas (obtido com o @userinfobot no Telegram)
-chat_id = 123456789
 ```
+
+> **E o Telegram?** Não fica aqui. O destino dos alertas é configurado pelo
+> próprio `telegram-send` (passo 7), que guarda token e chat no arquivo dele.
 
 > **Como descobrir o ID USB da impressora?**
 > Com a impressora conectada, execute `lsusb` no terminal. Você verá linhas como:
@@ -250,11 +249,18 @@ source venv/bin/activate
 telegram-send --configure
 ```
 
-Siga as instruções na tela: ele vai pedir o token do bot e enviar uma mensagem de teste.
+Siga as instruções na tela: ele pede o token do bot, manda você enviar uma senha
+ao bot pelo aplicativo, descobre sozinho para qual chat responder e envia uma
+mensagem de teste.
 
-3. Para descobrir o seu `chat_id`, envie qualquer mensagem para o seu bot e acesse:
-`https://api.telegram.org/bot<SEU_TOKEN>/getUpdates`
-O `chat_id` aparece no campo `"chat": {"id": ...}`.
+3. Pronto — não há nada de Telegram para preencher no `config.ini`. O token e o
+chat ficam em `~/.config/telegram-send.conf`, criado pelo comando acima, e é de
+lá que o ATM os lê ao enviar cada alerta.
+
+> **Rodando como serviço?** O `telegram-send` procura a configuração no `HOME`
+> do usuário que executa o processo. Configure-o com o mesmo usuário do campo
+> `User=` do systemd, ou os alertas falham em silêncio (a falha é registrada em
+> nível de aviso e nunca interrompe um pagamento).
 
 ---
 

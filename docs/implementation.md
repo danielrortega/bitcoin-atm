@@ -234,7 +234,12 @@ operador reembolsa o cliente ou corrige o destino e reprocessa manualmente
 | `serial_port` | `hardware` | Porta serial do noteiro (ex.: `/dev/ttyUSB0`) |
 | `baud_rate` | `hardware` | Baud rate serial (ex.: `9600`) |
 | `printer_usb` | `hardware` | ID USB da impressora `vendor:product` (ex.: `0416:5011`) |
-| `chat_id` | `telegram` | ID do chat para alertas |
+
+Alertas do Telegram não têm campo aqui: `_send_telegram` chama
+`telegram_send.send()`, que lê token e chat do arquivo do próprio
+`telegram-send` (`~/.config/telegram-send.conf`, criado por
+`telegram-send --configure`). O `config.ini` chegou a ter um `[telegram]
+chat_id`, mas nenhum código o lia — o operador configurava um campo morto.
 
 ---
 
