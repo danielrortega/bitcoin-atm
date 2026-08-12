@@ -6,4 +6,6 @@ qrcode==8.2
 pillow==12.3.0
 python-escpos==3.1
 telegram-send==0.39.2
+# Habilita proxies socks5:// no requests (ALL_PROXY), usado para alcançar
+# destinos .onion via Tor. Veja a seção do systemd no README.
 pysocks==1.7.1

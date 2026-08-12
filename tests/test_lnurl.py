@@ -9,6 +9,7 @@ A verificação do valor da invoice é a outra metade: um servidor LNURL hostil
 poderia devolver uma invoice de valor maior que o solicitado.
 """
 
+import os
 import unittest
 from decimal import Decimal
 from unittest import mock
@@ -70,12 +71,42 @@ class TestGuardaSSRF(unittest.TestCase):
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core._assert_safe_lnurl_url('https://malicioso.com/cb')
 
-    def test_onion_dispensa_inspecao_de_ip(self):
-        """Endereço .onion não resolve para IP; quem roteia é o Tor."""
-        with mock.patch.object(atm_core.socket, 'getaddrinfo',
-                               side_effect=AssertionError('não deveria resolver')):
-            atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
-            atm_core._assert_safe_lnurl_url('https://abc.onion/cb')
+    def test_onion_sem_proxy_e_recusado(self):
+        """Sem proxy SOCKS o .onion não é alcançável, e isentá-lo da checagem
+        de IP interno seria só um jeito de driblar a proteção: bastaria um
+        resolvedor local devolver 127.0.0.1 para um nome terminado em .onion."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(atm_core.PaymentNotBroadcast):
+                atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
+
+    def test_onion_com_proxy_socks_dispensa_inspecao_de_ip(self):
+        """Com o proxy ativo o ATM conecta AO PROXY, que resolve o nome
+        remotamente — não há resolução local que faça sentido inspecionar."""
+        for var in ('ALL_PROXY', 'all_proxy', 'HTTPS_PROXY'):
+            with self.subTest(var):
+                with mock.patch.dict(os.environ,
+                                     {var: 'socks5h://127.0.0.1:9050'}, clear=True):
+                    with mock.patch.object(
+                            atm_core.socket, 'getaddrinfo',
+                            side_effect=AssertionError('não deveria resolver')):
+                        atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
+                        atm_core._assert_safe_lnurl_url('https://abc.onion/cb')
+
+    def test_proxy_nao_socks_nao_libera_onion(self):
+        """Um proxy HTTP comum não alcança a rede Tor."""
+        with mock.patch.dict(os.environ,
+                             {'ALL_PROXY': 'http://proxy.interno:3128'}, clear=True):
+            with self.assertRaises(atm_core.PaymentNotBroadcast):
+                atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
+
+    def test_proxy_socks_nao_dispensa_a_checagem_em_clearnet(self):
+        """A isenção vale só para .onion: um domínio comum continua tendo o IP
+        inspecionado, mesmo com proxy configurado."""
+        with mock.patch.dict(os.environ,
+                             {'ALL_PROXY': 'socks5h://127.0.0.1:9050'}, clear=True):
+            with resolve_para('127.0.0.1'):
+                with self.assertRaises(atm_core.PaymentNotBroadcast):
+                    atm_core._assert_safe_lnurl_url('https://malicioso.com/cb')
 
     def test_falha_de_dns_e_nao_transmitido(self):
         with mock.patch.object(atm_core.socket, 'getaddrinfo',

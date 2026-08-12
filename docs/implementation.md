@@ -137,8 +137,20 @@ invoice BOLT11 com o valor exato, em `atm_core._resolve_lightning_address`:
 **Classificação de erros:** toda a resolução ocorre *antes* de qualquer chamada
 de pagamento ao BTCPay, então qualquer falha (rede, HTTP ≠ 200, JSON inválido,
 valor fora dos limites, valor divergente) é `PaymentNotBroadcast` — seguro
-reenfileirar, pois nenhum fundo saiu. Domínios `.onion` usam `http` (via Tor);
-clearnet exige `https`.
+reenfileirar, pois nenhum fundo saiu.
+
+**Tor (`.onion`):** clearnet exige `https`; domínios `.onion` usam `http` e são
+dispensados da inspeção de IP interno — mas **só quando há um proxy SOCKS
+configurado no ambiente** (`ALL_PROXY`, `HTTPS_PROXY` ou `HTTP_PROXY` começando
+com `socks`), que o `requests` já honra sozinho. É o que torna a dispensa
+legítima: com o proxy ativo, o ATM conecta ao proxy e é ele quem resolve o nome
+e roteia, então não existe resolução local que faça sentido inspecionar.
+
+Sem proxy, um `.onion` não seria alcançável de qualquer maneira, e aceitá-lo
+serviria apenas para pular a proteção anti-SSRF — bastaria um resolvedor local
+devolver `127.0.0.1` para um nome terminado em `.onion`. Por isso o destino é
+recusado com uma mensagem explícita. Para habilitar, veja a linha
+`Environment=ALL_PROXY=...` na seção do systemd no README.
 
 **Compatibilidade:** funciona com qualquer carteira que implemente LNURL-pay —
 Wallet of Satoshi, Blink, Phoenix, etc. O endereço é fixo, então o cliente pode

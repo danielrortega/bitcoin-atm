@@ -309,6 +309,27 @@ def _resolve_lightning_address(address, amount_btc):
     return invoice
 
 
+# Variáveis de ambiente que o requests já honra para rotear as chamadas. Um
+# valor socks5h:// aponta para um proxy que também resolve o DNS remotamente —
+# é o que permite alcançar .onion (ver README, seção do systemd).
+_PROXY_ENV_VARS = ('all_proxy', 'https_proxy', 'http_proxy')
+
+
+def _socks_proxy_ativo():
+    """True se houver um proxy SOCKS configurado no ambiente.
+
+    É o que decide se um destino .onion pode ser aceito. Com o proxy ativo, o
+    ATM conecta AO PROXY e é ele quem resolve o nome e roteia — não há
+    resolução local para inspecionar, e a checagem de IP interno não teria
+    sentido. Sem o proxy, um .onion simplesmente não é alcançável, e aceitá-lo
+    só serviria para pular a proteção anti-SSRF."""
+    for var in _PROXY_ENV_VARS:
+        valor = os.environ.get(var) or os.environ.get(var.upper()) or ''
+        if valor.strip().lower().startswith('socks'):
+            return True
+    return False
+
+
 def _assert_safe_lnurl_url(url):
     """Defesa anti-SSRF: o domínio e a URL de callback do LNURL vêm do cliente
     (e de um servidor que ele controla). Sem esta checagem, um cliente hostil
@@ -329,7 +350,17 @@ def _assert_safe_lnurl_url(url):
     else:
         raise PaymentNotBroadcast(f"esquema LNURL não permitido: {parsed.scheme}")
     if is_onion:
-        return  # resolvido pelo Tor; não há IP local para inspecionar
+        # A isenção da checagem de IP só é legítima quando existe de fato um
+        # proxy para rotear: aí o destino da conexão é o proxy, e o nome é
+        # resolvido remotamente. Sem proxy, o .onion não seria alcançável de
+        # qualquer forma, e a isenção viraria só um jeito de driblar a
+        # proteção — bastaria um resolvedor local devolver 127.0.0.1 para um
+        # nome terminado em .onion.
+        if not _socks_proxy_ativo():
+            raise PaymentNotBroadcast(
+                f"destino {host} exige Tor, mas nenhum proxy SOCKS está "
+                "configurado neste ATM")
+        return  # roteado pelo proxy; não há IP local para inspecionar
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
