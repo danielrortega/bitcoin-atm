@@ -269,22 +269,55 @@ class TestLeituraSerial(unittest.TestCase):
         self.assertIsNone(win.amount_brl)
 
 
-class TestNotaEngolidaDuranteOPagamento(unittest.TestCase):
-    """ACHADO 3 DA REVISÃO — falha esperada até a correção.
+class TestNotaDuranteOPagamento(unittest.TestCase):
+    """Cédula inserida enquanto o envio está em andamento.
 
-    Descartar os bytes lidos durante o pagamento está certo (evita nota
-    fantasma), mas hoje isso acontece sem UMA LINHA de log. A cédula está
-    dentro da máquina e não existe registro para reembolsar o cliente —
-    diferente do caminho do teto, que registra em nível crítico.
+    Descartar o valor está certo — creditar depois do reset viraria uma "nota
+    fantasma". O que faltava era o registro: a cédula está fisicamente dentro
+    da máquina e, sem uma linha de log, não sobrava nada para o operador
+    reembolsar o cliente. O caminho do teto por transação sempre registrou em
+    nível crítico; este não.
 
-    Correção prevista: registrar o valor em nível CRÍTICO antes de descartar,
-    e inibir o noteiro por hardware durante o envio."""
+    A inibição do noteiro por hardware durante o envio continua sendo o
+    complemento recomendado em produção — o log documenta a perda, não a evita."""
 
-    @unittest.expectedFailure
-    def test_nota_descartada_deve_gerar_log_critico(self):
+    def test_gera_log_critico_com_o_valor_da_cedula(self):
+        win = support.make_window(polls=[frame(50)], _payment_in_flight=True)
+        with self.assertLogs(level=logging.CRITICAL) as cm:
+            win.check_note()
+        self.assertIn('50', cm.output[0])
+        self.assertIn('REEMBOLSO', cm.output[0].upper())
+
+    def test_continua_sem_creditar(self):
         win = support.make_window(polls=[frame(50)], _payment_in_flight=True)
         with self.assertLogs(level=logging.CRITICAL):
             win.check_note()
+        self.assertIsNone(win.amount_brl)
+
+    def test_cada_cedula_gera_seu_proprio_registro(self):
+        """Duas notas na mesma janela são duas perdas distintas a reembolsar."""
+        win = support.make_window(polls=[frame(50) + frame(100)],
+                                  _payment_in_flight=True)
+        with self.assertLogs(level=logging.CRITICAL) as cm:
+            win.check_note()
+        self.assertEqual(len(cm.output), 2)
+        self.assertIn('50', cm.output[0])
+        self.assertIn('100', cm.output[1])
+
+    def test_quadro_partido_durante_o_envio_tambem_e_registrado(self):
+        """O buffer residual atravessa os polls também no caminho de descarte;
+        senão a metade que sobra não viraria registro nenhum."""
+        win = support.make_window(polls=[b'\x00', b'\x32'], _payment_in_flight=True)
+        win.check_note()
+        with self.assertLogs(level=logging.CRITICAL) as cm:
+            win.check_note()
+        self.assertIn('50', cm.output[0])
+
+    def test_tela_orienta_o_cliente_a_parar(self):
+        win = support.make_window(polls=[frame(50)], _payment_in_flight=True)
+        with self.assertLogs(level=logging.CRITICAL):
+            win.check_note()
+        self.assertIn('operador', win.instruction_label.text.lower())
 
 
 if __name__ == '__main__':

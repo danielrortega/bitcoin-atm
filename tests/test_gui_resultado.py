@@ -105,33 +105,54 @@ class TestFalhaIncerta(BaseDesfecho):
 
 
 class TestRegistroParaReconciliacao(BaseDesfecho):
-    """ACHADO 4 DA REVISÃO — falhas esperadas até a correção.
+    """Registro dos desfechos que exigem ação humana.
 
-    Nos dois cenários abaixo o cliente pagou e pode ter ficado sem nada, e a
-    única saída é uma caixa de diálogo — num quiosque em tela cheia, sem
-    ninguém na frente. Não há log com valor, destino e método, justo nos casos
-    em que a mensagem manda o operador conferir manualmente.
+    Nos dois cenários abaixo o cliente pagou e pode ter ficado sem nada. A
+    caixa de diálogo não serve como registro: some no próximo cliente, num
+    quiosque em tela cheia sem ninguém na frente. Sem log com valor, destino e
+    método, a mensagem manda o operador conferir uma transação que ele não tem
+    como identificar."""
 
-    Correção prevista: logging.critical com a transação completa antes de
-    exibir o diálogo."""
-
-    @unittest.expectedFailure
-    def test_falha_incerta_deve_ser_registrada(self):
+    def test_falha_incerta_e_registrada(self):
         win = self.janela_em_pagamento(amount=150)
         with self.assertLogs(level=logging.CRITICAL) as cm:
             win._on_payment_error(atm_core.PaymentUncertain('timeout'))
-        self.assertIn('150', ' '.join(cm.output))
-        self.assertIn(DESTINO, ' '.join(cm.output))
+        registro = ' '.join(cm.output)
+        self.assertIn('150', registro)
+        self.assertIn(DESTINO, registro)
+        self.assertIn('onchain', registro)
+        self.assertIn('carteira', registro.lower())
 
-    @unittest.expectedFailure
-    def test_falha_ao_enfileirar_deve_ser_registrada(self):
-        """Pior caso do sistema: não enviou E não conseguiu enfileirar. Sem
-        log, não sobra nenhum registro do que o cliente pagou."""
+    def test_falha_ao_enfileirar_e_registrada(self):
+        """Pior caso do sistema: não enviou E não conseguiu enfileirar. O log é
+        o único registro que sobra do que o cliente pagou."""
         self.enfileirar.side_effect = OSError('disco cheio')
         win = self.janela_em_pagamento(amount=150)
         with self.assertLogs(level=logging.CRITICAL) as cm:
             win._on_payment_error(atm_core.PaymentNotBroadcast('sem conexão'))
-        self.assertIn('150', ' '.join(cm.output))
+        registro = ' '.join(cm.output)
+        self.assertIn('150', registro)
+        self.assertIn(DESTINO, registro)
+        self.assertIn('disco cheio', registro)
+
+    def test_enfileiramento_bem_sucedido_nao_dispara_alarme(self):
+        """Um CRÍTICO em desfecho normal treinaria o operador a ignorar todos.
+        A transação enfileirada já é registrada em nível INFO por
+        enqueue_transaction."""
+        win = self.janela_em_pagamento(amount=150)
+        with self.assertLogs(level=logging.INFO) as cm:
+            logging.info('marcador para o assertLogs ter ao menos um registro')
+            win._on_payment_error(atm_core.PaymentNotBroadcast('sem conexão'))
+        self.assertEqual(
+            [m for m in cm.output if m.startswith('CRITICAL')], [])
+
+    def test_sucesso_nao_dispara_alarme(self):
+        win = self.janela_em_pagamento(amount=150)
+        with self.assertLogs(level=logging.INFO) as cm:
+            logging.info('marcador para o assertLogs ter ao menos um registro')
+            win._on_payment_result('abc123')
+        self.assertEqual(
+            [m for m in cm.output if m.startswith('CRITICAL')], [])
 
 
 class TestErroDeConfiguracaoNaGui(BaseDesfecho):

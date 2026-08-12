@@ -24,7 +24,7 @@ impressora, janela ou conexão de rede.
 A saída normal hoje é:
 
 ```
-OK (expected failures=4)
+OK (expected failures=1)
 ```
 
 Cada `@unittest.expectedFailure` documenta um bug conhecido, com a correção
@@ -32,8 +32,6 @@ prevista no docstring da classe:
 
 | Testes | Achado |
 |---|---|
-| `test_notes.TestNotaEngolidaDuranteOPagamento` | Cédula inserida durante o envio é descartada sem nenhum registro para reembolso. |
-| `test_gui_resultado.TestRegistroParaReconciliacao` | Falha incerta e falha de enfileiramento só produzem uma caixa de diálogo; não há log com valor e destino para reconciliar. |
 | `test_offline_queue.TestRetentativaInfinita` | Transação que falha de forma determinística é retentada a cada 5 minutos para sempre, sem contador de tentativas nem fila de descarte. |
 
 **Ao corrigir um desses bugs, remova o `@unittest.expectedFailure`.** Se
@@ -54,6 +52,13 @@ Já corrigidos por este caminho:
   `test_notes.TestBufferResidual`, incluindo dois testes de fuzz que cobrem
   cortes de pedaço arbitrários nas duas direções (nunca perder cédula em fluxo
   limpo, nunca criar dinheiro com ruído).
+- **Desfechos que exigem uma pessoa** não deixavam registro: cédula inserida
+  durante o envio, resultado incerto e falha de enfileiramento produziam no
+  máximo uma caixa de diálogo, que some no cliente seguinte. Hoje os três
+  registram valor, destino e método em nível `CRITICAL` — ver
+  `test_notes.TestNotaDuranteOPagamento` e
+  `test_gui_resultado.TestRegistroParaReconciliacao`, que também fixa o outro
+  lado: desfecho normal NÃO gera `CRITICAL`, para o nível não virar ruído.
 
 ## Convenção
 

@@ -65,6 +65,10 @@ Tudo que roda antes do POST — ler o `config.ini`, ler `/etc/atm/key`, descript
   máximo uma cédula, pois a nota já está dentro da máquina quando o valor é
   lido — a inibição do noteiro por hardware é o complemento recomendado em
   produção.
+- **Cédula durante o envio**: o buffer serial continua sendo drenado enquanto o
+  pagamento roda (senão os bytes seriam creditados como "nota fantasma" logo
+  após o reset), mas o valor lido é registrado em nível crítico para reembolso
+  manual, em vez de sumir sem rastro.
 
 ### Precisão decimal
 
@@ -192,3 +196,23 @@ tail -f /var/log/btc_atm.log
 # ou, se rodando como serviço systemd:
 sudo journalctl -u bitcoin-atm -f
 ```
+
+### Nível CRÍTICO = dinheiro parado esperando uma pessoa
+
+Todo registro `CRITICAL` significa que um cliente pode ter ficado sem o que
+pagou, e nenhum deles se resolve sozinho. São só quatro situações, todas com
+valor e destino na própria mensagem, porque a caixa de diálogo na tela some no
+cliente seguinte:
+
+```
+CRITICAL Nota de R$50 recusada: teto de R$1000 por transação já atingido ...
+CRITICAL Nota de R$50 inserida durante o envio e NÃO creditada. REEMBOLSO ...
+CRITICAL Pagamento com resultado INCERTO: R$150 para bc1q... (onchain). Confira
+         a carteira no BTCPay ANTES de reenviar (risco de gasto duplo). ...
+CRITICAL TRANSAÇÃO PERDIDA: R$150 para bc1q... (onchain) não foi enviada nem
+         enfileirada. Envio: ... | Enfileiramento: ...
+```
+
+Vale a pena alertar sobre esse nível (por exemplo, `journalctl -p crit`).
+Desfechos normais — inclusive uma transação enfileirada por falta de conexão —
+ficam em `INFO`, para que um `CRITICAL` nunca vire ruído ignorável.

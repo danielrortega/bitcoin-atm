@@ -237,7 +237,19 @@ class BTMWindow(QMainWindow):
             return
 
         if self._payment_in_flight:
-            return  # buffer já drenado; ignora qualquer entrada durante o envio
+            # O buffer já foi drenado acima (é o que evita a "nota fantasma"
+            # creditada logo após o reset), mas a cédula está FISICAMENTE
+            # dentro da máquina. Sem este registro, ela sumia sem deixar
+            # rastro: nem crédito para o cliente, nem informação para o
+            # operador reembolsar. Interpretar o valor aqui é o que torna o
+            # reembolso possível — creditar é que não se pode.
+            for note_value in self._parse_notes(data):
+                logging.critical(
+                    "Nota de R$%s inserida durante o envio e NÃO creditada. "
+                    "REEMBOLSO MANUAL NECESSÁRIO.", note_value)
+                self.instruction_label.setText(
+                    "Não insira notas durante o envio — procure o operador.")
+            return
 
         if data:
             for note_value in self._parse_notes(data):
@@ -445,6 +457,12 @@ class BTMWindow(QMainWindow):
                     f"Não foi possível enviar agora ({exc}).\n\n"
                     "A transação foi enfileirada e será processada automaticamente.")
             except Exception as enq:
+                # Pior caso do sistema: não enviou E não conseguiu enfileirar.
+                # O log é o único registro que sobra do que o cliente pagou.
+                logging.critical(
+                    "TRANSAÇÃO PERDIDA: R$%s para %s (%s) não foi enviada nem "
+                    "enfileirada. Envio: %s | Enfileiramento: %s",
+                    amount_brl, destination, payment_type, exc, enq)
                 self.status_label.setText("Erro ao enfileirar!")
                 self.status_label.setStyleSheet("color: red;")
                 QMessageBox.critical(self, "Erro",
@@ -452,7 +470,13 @@ class BTMWindow(QMainWindow):
         else:
             # Resultado AMBÍGUO (timeout/5xx) ou erro inesperado. O Bitcoin
             # pode já ter sido enviado: NÃO reenfileira, para evitar gasto
-            # duplo. Operador precisa conferir manualmente.
+            # duplo. Operador precisa conferir manualmente — e a mensagem na
+            # tela some no próximo cliente, então o registro tem que ficar no
+            # log, com o que basta para reconciliar com a carteira.
+            logging.critical(
+                "Pagamento com resultado INCERTO: R$%s para %s (%s). Confira a "
+                "carteira no BTCPay ANTES de reenviar (risco de gasto duplo). "
+                "Erro: %s", amount_brl, destination, payment_type, exc)
             self.status_label.setText("Falha incerta — verifique a carteira!")
             self.status_label.setStyleSheet("color: red;")
             QMessageBox.critical(self, "Verificação necessária",
