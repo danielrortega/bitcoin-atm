@@ -391,8 +391,15 @@ def process_offline_queue():
     retransmitido no próximo processamento — preferimos, no pior caso, perder
     o registro (reconciliável pelos logs) a arriscar um gasto duplo. Só uma
     falha comprovadamente-não-transmitida (PaymentNotBroadcast) recoloca a
-    transação na fila."""
-    while True:
+    transação na fila — no FIM, e sem ser retentada nesta mesma passagem."""
+    # Processa no máximo os itens presentes no início. Sem este limite, uma tx
+    # que falha de forma determinística (ex.: endereço inválido → 4xx →
+    # PaymentNotBroadcast) seria reenfileirada e repescada imediatamente, num
+    # laço infinito martelando o BTCPay. Itens reenfileirados esperam o
+    # próximo ciclo de retry.
+    with _QUEUE_LOCK:
+        pending = len(_load_queue())
+    for _ in range(pending):
         with _QUEUE_LOCK:
             queue = _load_queue()
             if not queue:

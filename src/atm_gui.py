@@ -67,6 +67,9 @@ class BTMWindow(QMainWindow):
     # Denominações válidas das cédulas de real (BRL). Qualquer leitura fora
     # deste conjunto é tratada como ruído/erro e descartada — nunca creditada.
     VALID_DENOMINATIONS = frozenset({2, 5, 10, 20, 50, 100, 200})
+    # Bytes por cédula no protocolo do noteiro (big-endian). É o contrato usado
+    # pela POC com socat; um BV20 real usa framing próprio e exigirá ajuste.
+    NOTE_FRAME_BYTES = 2
 
     def __init__(self):
         super().__init__()
@@ -236,8 +239,7 @@ class BTMWindow(QMainWindow):
             return  # buffer já drenado; ignora qualquer entrada durante o envio
 
         if data:
-            note_value = self._parse_note(data)
-            if note_value:
+            for note_value in self._parse_notes(data):
                 self._credit_note(note_value)
             return
 
@@ -284,18 +286,32 @@ class BTMWindow(QMainWindow):
                 f"Limite de R${self.max_transaction_brl} atingido — "
                 "escolha o método de envio")
 
-    def _parse_note(self, data):
-        """Interpreta os bytes do noteiro como um valor em BRL e valida contra
-        as denominações reais de cédulas. Rejeita ruído elétrico e frames de
-        duas notas concatenados no buffer — que, com int.from_bytes sobre o
-        buffer inteiro, virariam um valor astronômico. Sem esta whitelist, um
-        glitch poderia creditar R$ milhões e convertê-los em Bitcoin real."""
-        value = int.from_bytes(data, "big")
-        if value in self.VALID_DENOMINATIONS:
-            return value
-        logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
-                        value, data.hex())
-        return None
+    def _parse_notes(self, data):
+        """Interpreta o buffer do noteiro como uma sequência de quadros de
+        NOTE_FRAME_BYTES bytes, um por cédula, e valida cada valor contra as
+        denominações reais de cédulas BRL.
+
+        O enquadramento importa: se duas notas chegam dentro da mesma janela
+        de leitura (1s), o buffer traz os dois quadros juntos. Interpretar o
+        buffer inteiro com um único int.from_bytes daria um valor absurdo —
+        que, sem whitelist, seria creditado como R$ milhões e convertido em
+        Bitcoin real; e, com whitelist, faria as DUAS notas serem engolidas
+        sem crédito. Lendo quadro a quadro, ambas são creditadas corretamente.
+
+        Ruído elétrico e buffers desalinhados são descartados com log."""
+        if not data or len(data) % self.NOTE_FRAME_BYTES:
+            logging.warning("Buffer do noteiro desalinhado, descartado: %s",
+                            data.hex())
+            return []
+        notes = []
+        for i in range(0, len(data), self.NOTE_FRAME_BYTES):
+            value = int.from_bytes(data[i:i + self.NOTE_FRAME_BYTES], "big")
+            if value in self.VALID_DENOMINATIONS:
+                notes.append(value)
+            else:
+                logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
+                                value, data[i:i + self.NOTE_FRAME_BYTES].hex())
+        return notes
 
     def _on_address_changed(self, text):
         if self._payment_in_flight:
