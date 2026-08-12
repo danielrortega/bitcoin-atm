@@ -137,8 +137,20 @@ invoice BOLT11 com o valor exato, em `atm_core._resolve_lightning_address`:
 **Classificação de erros:** toda a resolução ocorre *antes* de qualquer chamada
 de pagamento ao BTCPay, então qualquer falha (rede, HTTP ≠ 200, JSON inválido,
 valor fora dos limites, valor divergente) é `PaymentNotBroadcast` — seguro
-reenfileirar, pois nenhum fundo saiu. Domínios `.onion` usam `http` (via Tor);
-clearnet exige `https`.
+reenfileirar, pois nenhum fundo saiu.
+
+**Tor (`.onion`):** clearnet exige `https`; domínios `.onion` usam `http` e são
+dispensados da inspeção de IP interno — mas **só quando há um proxy SOCKS
+configurado no ambiente** (`ALL_PROXY`, `HTTPS_PROXY` ou `HTTP_PROXY` começando
+com `socks`), que o `requests` já honra sozinho. É o que torna a dispensa
+legítima: com o proxy ativo, o ATM conecta ao proxy e é ele quem resolve o nome
+e roteia, então não existe resolução local que faça sentido inspecionar.
+
+Sem proxy, um `.onion` não seria alcançável de qualquer maneira, e aceitá-lo
+serviria apenas para pular a proteção anti-SSRF — bastaria um resolvedor local
+devolver `127.0.0.1` para um nome terminado em `.onion`. Por isso o destino é
+recusado com uma mensagem explícita. Para habilitar, veja a linha
+`Environment=ALL_PROXY=...` na seção do systemd no README.
 
 **Compatibilidade:** funciona com qualquer carteira que implemente LNURL-pay —
 Wallet of Satoshi, Blink, Phoenix, etc. O endereço é fixo, então o cliente pode
@@ -222,7 +234,12 @@ operador reembolsa o cliente ou corrige o destino e reprocessa manualmente
 | `serial_port` | `hardware` | Porta serial do noteiro (ex.: `/dev/ttyUSB0`) |
 | `baud_rate` | `hardware` | Baud rate serial (ex.: `9600`) |
 | `printer_usb` | `hardware` | ID USB da impressora `vendor:product` (ex.: `0416:5011`) |
-| `chat_id` | `telegram` | ID do chat para alertas |
+
+Alertas do Telegram não têm campo aqui: `_send_telegram` chama
+`telegram_send.send()`, que lê token e chat do arquivo do próprio
+`telegram-send` (`~/.config/telegram-send.conf`, criado por
+`telegram-send --configure`). O `config.ini` chegou a ter um `[telegram]
+chat_id`, mas nenhum código o lia — o operador configurava um campo morto.
 
 ---
 

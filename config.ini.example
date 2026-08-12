@@ -34,5 +34,5 @@ baud_rate = 9600
 ; ex.: 0416:5011
 printer_usb = usb_printer_id
 
-[telegram]
-chat_id = your_telegram_chat_id
+; Alertas do Telegram não são configurados aqui: o destino fica no arquivo do
+; próprio telegram-send (`telegram-send --configure`), que o ATM usa ao enviar.

@@ -69,14 +69,6 @@ def _build_serial():
     return {'serial': m}
 
 
-def _build_qrcode():
-    """utils.py importa qrcode/PIL no topo do módulo por causa de
-    generate_qr_code(), que nenhum caminho de execução chama."""
-    m = types.ModuleType('qrcode')
-    m.QRCode = type('QRCode', (), {})
-    return {'qrcode': m}
-
-
 def _build_pyqt5():
     """Stub mínimo do PyQt5: só o suficiente para o import de atm_gui e para
     a criação das classes. Nenhum teste instancia widget — a lógica exercitada
@@ -102,7 +94,6 @@ def _build_pyqt5():
 _stub_if_missing('telegram_send', _build_telegram)
 _stub_if_missing('escpos.printer', _build_escpos)
 _stub_if_missing('serial', _build_serial)
-_stub_if_missing('qrcode', _build_qrcode)
 _stub_if_missing('PyQt5.QtWidgets', _build_pyqt5)
 
 

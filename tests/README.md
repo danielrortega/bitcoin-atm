@@ -14,7 +14,7 @@ python -m unittest discover -s tests -k test_teto_recusa_cedula_seguinte
 ```
 
 Nada além da biblioteca padrão é necessário. As dependências de hardware
-(PyQt5, pyserial, escpos, telegram-send, qrcode) recebem stubs em
+(PyQt5, pyserial, escpos, telegram-send) recebem stubs em
 `support.py` **só quando não estão instaladas** — no Raspberry Pi, com o
 `venv` completo, os módulos reais são usados. Nenhum teste abre porta serial,
 impressora, janela ou conexão de rede.
