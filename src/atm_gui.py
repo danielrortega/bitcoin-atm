@@ -145,6 +145,7 @@ class BTMWindow(QMainWindow):
         self.operated_rate = None
         self.destination = None
         self.payment_type = None
+        self._note_buf = b''       # quadro incompleto aguardando o resto
 
         # Threading
         self.threadpool = QThreadPool()
@@ -287,30 +288,49 @@ class BTMWindow(QMainWindow):
                 "escolha o método de envio")
 
     def _parse_notes(self, data):
-        """Interpreta o buffer do noteiro como uma sequência de quadros de
+        """Interpreta o fluxo do noteiro como uma sequência de quadros de
         NOTE_FRAME_BYTES bytes, um por cédula, e valida cada valor contra as
         denominações reais de cédulas BRL.
 
-        O enquadramento importa: se duas notas chegam dentro da mesma janela
-        de leitura (1s), o buffer traz os dois quadros juntos. Interpretar o
-        buffer inteiro com um único int.from_bytes daria um valor absurdo —
-        que, sem whitelist, seria creditado como R$ milhões e convertido em
-        Bitcoin real; e, com whitelist, faria as DUAS notas serem engolidas
-        sem crédito. Lendo quadro a quadro, ambas são creditadas corretamente.
+        O enquadramento importa nas duas pontas:
 
-        Ruído elétrico e buffers desalinhados são descartados com log."""
-        if not data or len(data) % self.NOTE_FRAME_BYTES:
-            logging.warning("Buffer do noteiro desalinhado, descartado: %s",
-                            data.hex())
-            return []
+        - Duas notas na mesma janela de leitura (1s) chegam como dois quadros
+          no mesmo buffer. Interpretar o buffer inteiro com um único
+          int.from_bytes daria um valor absurdo — que, sem whitelist, seria
+          creditado como R$ milhões e convertido em Bitcoin real; e, com
+          whitelist, faria as DUAS notas serem engolidas sem crédito.
+
+        - Uma nota só pode ter o quadro PARTIDO entre duas leituras: nada
+          garante que os 2 bytes cheguem no mesmo poll. Descartar cada metade
+          por estar desalinhada engolia a cédula inteira, que já estava dentro
+          da máquina. Por isso o que sobra fica guardado para a leitura
+          seguinte, e não é descartado de imediato.
+
+        Um par de bytes que não corresponde a nenhuma denominação faz o fluxo
+        avançar UM byte e tentar de novo, em vez de descartar o par inteiro.
+        Essa ressincronização é o que impede um único byte de ruído de deslocar
+        todos os quadros seguintes — sem ela, cada cédula posterior seria lida
+        metade com metade, rejeitada pela whitelist e engolida em silêncio.
+
+        Ressincronizar não pode creditar uma nota que não existe: toda
+        denominação válida tem o byte alto 0x00, e uma leitura deslocada sempre
+        põe o byte baixo do quadro anterior nessa posição."""
+        buf = self._note_buf + data
         notes = []
-        for i in range(0, len(data), self.NOTE_FRAME_BYTES):
-            value = int.from_bytes(data[i:i + self.NOTE_FRAME_BYTES], "big")
+        while len(buf) >= self.NOTE_FRAME_BYTES:
+            quadro = buf[:self.NOTE_FRAME_BYTES]
+            value = int.from_bytes(quadro, "big")
             if value in self.VALID_DENOMINATIONS:
                 notes.append(value)
+                buf = buf[self.NOTE_FRAME_BYTES:]
             else:
-                logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
-                                value, data[i:i + self.NOTE_FRAME_BYTES].hex())
+                logging.warning("Quadro inválido do noteiro (%s = %s); "
+                                "descartando 1 byte e ressincronizando.",
+                                quadro.hex(), value)
+                buf = buf[1:]
+        # Sobra no máximo NOTE_FRAME_BYTES-1 bytes: um quadro pela metade,
+        # que a próxima leitura completa.
+        self._note_buf = buf
         return notes
 
     def _on_address_changed(self, text):
@@ -449,6 +469,9 @@ class BTMWindow(QMainWindow):
         self.destination = None
         self.payment_type = None
         self._pending = None
+        # Um quadro pela metade não pode atravessar para o próximo cliente:
+        # combinado com os bytes dele, corromperia a leitura da primeira nota.
+        self._note_buf = b''
         self.instruction_label.setText("Insira uma nota no noteiro")
         self.status_label.setText("Aguardando...")
         self.status_label.setStyleSheet("color: black;")

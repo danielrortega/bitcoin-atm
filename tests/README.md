@@ -24,7 +24,7 @@ impressora, janela ou conexão de rede.
 A saída normal hoje é:
 
 ```
-OK (expected failures=6)
+OK (expected failures=4)
 ```
 
 Cada `@unittest.expectedFailure` documenta um bug conhecido, com a correção
@@ -32,7 +32,6 @@ prevista no docstring da classe:
 
 | Testes | Achado |
 |---|---|
-| `test_notes.TestFramePartido` | Quadro de cédula partido entre dois polls de 1s é descartado pelas duas metades: a nota está na máquina e nada é creditado. |
 | `test_notes.TestNotaEngolidaDuranteOPagamento` | Cédula inserida durante o envio é descartada sem nenhum registro para reembolso. |
 | `test_gui_resultado.TestRegistroParaReconciliacao` | Falha incerta e falha de enfileiramento só produzem uma caixa de diálogo; não há log com valor e destino para reconciliar. |
 | `test_offline_queue.TestRetentativaInfinita` | Transação que falha de forma determinística é retentada a cada 5 minutos para sempre, sem contador de tentativas nem fila de descarte. |
@@ -41,12 +40,20 @@ prevista no docstring da classe:
 esquecer, o `unittest` reporta `UNEXPECTED SUCCESS` e o run termina com código
 de saída 1 — a correção não passa despercebida.
 
-Já corrigido por este caminho: erro antes do POST (config ilegível, chave
-Fernet ausente ou rotacionada) escapava como exceção crua e era tratado como
-resultado ambíguo, então a transação não era enfileirada nem reenfileirada e o
-dinheiro do cliente se perdia. Hoje é `PaymentNotBroadcast` — ver
-`test_payments.TestErroAntesDoBroadcast` e
-`test_gui_resultado.TestErroDeConfiguracaoNaGui`.
+Já corrigidos por este caminho:
+
+- **Erro antes do POST** (config ilegível, chave Fernet ausente ou rotacionada)
+  escapava como exceção crua e era tratado como resultado ambíguo, então a
+  transação não era enfileirada nem reenfileirada e o dinheiro do cliente se
+  perdia. Hoje é `PaymentNotBroadcast` — ver
+  `test_payments.TestErroAntesDoBroadcast` e
+  `test_gui_resultado.TestErroDeConfiguracaoNaGui`.
+- **Quadro de cédula partido entre duas leituras** era descartado pelas duas
+  metades: a nota estava dentro da máquina e nada era creditado. Hoje o resto
+  aguarda a leitura seguinte e o fluxo ressincroniza byte a byte — ver
+  `test_notes.TestBufferResidual`, incluindo dois testes de fuzz que cobrem
+  cortes de pedaço arbitrários nas duas direções (nunca perder cédula em fluxo
+  limpo, nunca criar dinheiro com ruído).
 
 ## Convenção
 

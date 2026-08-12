@@ -46,8 +46,17 @@ Tudo que roda antes do POST — ler o `config.ini`, ler `/etc/atm/key`, descript
 ### Aceitação de cédulas
 
 - **Whitelist de denominações**: só valores reais de cédulas BRL (2, 5, 10, 20,
-  50, 100, 200) são creditados; ruído elétrico ou frames concatenados no buffer
-  serial são descartados com log (`atm_gui._parse_note`).
+  50, 100, 200) são creditados (`atm_gui._parse_notes`).
+- **Enquadramento** (`NOTE_FRAME_BYTES`): o fluxo serial é lido em quadros de 2
+  bytes, um por cédula. Duas notas na mesma janela de leitura são creditadas
+  separadamente; um quadro partido entre duas leituras tem o resto guardado
+  para a leitura seguinte, em vez de ser descartado — descartar engolia a
+  cédula, que já estava dentro da máquina. Um par que não bate com nenhuma
+  denominação faz o fluxo avançar 1 byte e tentar de novo (ressincronização),
+  o que impede um byte de ruído de desalinhar todas as cédulas seguintes.
+  Ressincronizar não pode inventar uma nota: toda denominação válida tem byte
+  alto `0x00`, posição que numa leitura deslocada é sempre ocupada pelo byte
+  baixo do quadro anterior.
 - **Acúmulo**: múltiplas cédulas somam ao total (`atm_gui._credit_note`), até o
   momento de confirmar o pagamento — inclusive depois de escolher o método.
 - **Teto por transação** (`max_transaction_brl`): atingido o teto, novas cédulas

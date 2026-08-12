@@ -249,6 +249,7 @@ def make_window(polls=(), max_transaction_brl=1000, **overrides):
     win.destination = None
     win.payment_type = None
     win._payment_in_flight = False
+    win._note_buf = b''
     win.status_label = FakeLabel()
     win.instruction_label = FakeLabel()
     win.onchain_button = FakeButton()
