@@ -139,18 +139,12 @@ de pagamento ao BTCPay, então qualquer falha (rede, HTTP ≠ 200, JSON inválid
 valor fora dos limites, valor divergente) é `PaymentNotBroadcast` — seguro
 reenfileirar, pois nenhum fundo saiu.
 
-**Tor (`.onion`):** clearnet exige `https`; domínios `.onion` usam `http` e são
-dispensados da inspeção de IP interno — mas **só quando há um proxy SOCKS
-configurado no ambiente** (`ALL_PROXY`, `HTTPS_PROXY` ou `HTTP_PROXY` começando
-com `socks`), que o `requests` já honra sozinho. É o que torna a dispensa
-legítima: com o proxy ativo, o ATM conecta ao proxy e é ele quem resolve o nome
-e roteia, então não existe resolução local que faça sentido inspecionar.
-
-Sem proxy, um `.onion` não seria alcançável de qualquer maneira, e aceitá-lo
-serviria apenas para pular a proteção anti-SSRF — bastaria um resolvedor local
-devolver `127.0.0.1` para um nome terminado em `.onion`. Por isso o destino é
-recusado com uma mensagem explícita. Para habilitar, veja a linha
-`Environment=ALL_PROXY=...` na seção do systemd no README.
+**Sem exceção para `.onion`:** toda resolução LNURL exige `https` e passa pela
+inspeção de IP interno, sem nenhum caso especial. O ATM não roteia por Tor, de
+modo que um destino `.onion` não seria alcançável de qualquer maneira; dispensá-lo
+da checagem só criaria uma porta lateral, já que basta um resolvedor local
+devolver `127.0.0.1` para um nome terminado em `.onion` para que a proteção
+fosse contornada.
 
 **Compatibilidade:** funciona com qualquer carteira que implemente LNURL-pay —
 Wallet of Satoshi, Blink, Phoenix, etc. O endereço é fixo, então o cliente pode

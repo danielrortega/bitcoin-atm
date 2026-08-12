@@ -71,42 +71,23 @@ class TestGuardaSSRF(unittest.TestCase):
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core._assert_safe_lnurl_url('https://malicioso.com/cb')
 
-    def test_onion_sem_proxy_e_recusado(self):
-        """Sem proxy SOCKS o .onion não é alcançável, e isentá-lo da checagem
-        de IP interno seria só um jeito de driblar a proteção: bastaria um
-        resolvedor local devolver 127.0.0.1 para um nome terminado em .onion."""
-        with mock.patch.dict(os.environ, {}, clear=True):
+    def test_onion_nao_tem_tratamento_especial(self):
+        """O ATM não fala Tor. Um .onion não é alcançável de qualquer forma, e
+        dispensá-lo da checagem de IP interno só serviria para driblar a
+        proteção: bastaria um resolvedor local devolver 127.0.0.1 para um nome
+        terminado em .onion. Em http cai no esquema; em https, na resolução."""
+        with self.assertRaises(atm_core.PaymentNotBroadcast):
+            atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
+        with resolve_para('127.0.0.1'):
             with self.assertRaises(atm_core.PaymentNotBroadcast):
-                atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
+                atm_core._assert_safe_lnurl_url('https://abc.onion/cb')
 
-    def test_onion_com_proxy_socks_dispensa_inspecao_de_ip(self):
-        """Com o proxy ativo o ATM conecta AO PROXY, que resolve o nome
-        remotamente — não há resolução local que faça sentido inspecionar."""
-        for var in ('ALL_PROXY', 'all_proxy', 'HTTPS_PROXY'):
-            with self.subTest(var):
-                with mock.patch.dict(os.environ,
-                                     {var: 'socks5h://127.0.0.1:9050'}, clear=True):
-                    with mock.patch.object(
-                            atm_core.socket, 'getaddrinfo',
-                            side_effect=AssertionError('não deveria resolver')):
-                        atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
-                        atm_core._assert_safe_lnurl_url('https://abc.onion/cb')
-
-    def test_proxy_nao_socks_nao_libera_onion(self):
-        """Um proxy HTTP comum não alcança a rede Tor."""
-        with mock.patch.dict(os.environ,
-                             {'ALL_PROXY': 'http://proxy.interno:3128'}, clear=True):
-            with self.assertRaises(atm_core.PaymentNotBroadcast):
-                atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
-
-    def test_proxy_socks_nao_dispensa_a_checagem_em_clearnet(self):
-        """A isenção vale só para .onion: um domínio comum continua tendo o IP
-        inspecionado, mesmo com proxy configurado."""
+    def test_onion_com_proxy_no_ambiente_continua_recusado(self):
+        """Uma variável de proxy no ambiente não reabre a exceção."""
         with mock.patch.dict(os.environ,
                              {'ALL_PROXY': 'socks5h://127.0.0.1:9050'}, clear=True):
-            with resolve_para('127.0.0.1'):
-                with self.assertRaises(atm_core.PaymentNotBroadcast):
-                    atm_core._assert_safe_lnurl_url('https://malicioso.com/cb')
+            with self.assertRaises(atm_core.PaymentNotBroadcast):
+                atm_core._assert_safe_lnurl_url('http://abc.onion/cb')
 
     def test_falha_de_dns_e_nao_transmitido(self):
         with mock.patch.object(atm_core.socket, 'getaddrinfo',
@@ -220,9 +201,11 @@ class TestResolucao(unittest.TestCase):
         self.assertEqual(get.call_args_list[1].args[0],
                          f'https://dominio.com/cb?amount={self.MSATS}')
 
-    def test_onion_usa_http(self):
+    def test_onion_nao_ganha_esquema_proprio(self):
+        """Sem tratamento especial, um domínio .onion monta a mesma URL https
+        de qualquer outro — e é recusado pela guarda anti-SSRF na sequência."""
         _, get = self.resolver(endereco='joao@abc.onion')
-        self.assertTrue(get.call_args_list[0].args[0].startswith('http://abc.onion/'))
+        self.assertTrue(get.call_args_list[0].args[0].startswith('https://abc.onion/'))
 
     def test_callback_com_query_usa_e_comercial(self):
         _, get = self.resolver(meta=self.meta(callback='https://dominio.com/cb?id=7'))

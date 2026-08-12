@@ -315,10 +315,6 @@ Restart=always
 RestartSec=5
 User=seu_usuario
 Environment=DISPLAY=:0
-# Opcional: roteia todo o tráfego do ATM por Tor (exige o tor rodando na
-# máquina). É o que habilita destinos .onion — sem esta linha, o ATM recusa
-# endereços Lightning em .onion, porque não teria como alcançá-los.
-# Environment=ALL_PROXY=socks5h://127.0.0.1:9050
 
 [Install]
 WantedBy=multi-user.target

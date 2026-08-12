@@ -226,9 +226,10 @@ def validate_lightning_invoice(invoice, network=DEFAULT_NETWORK):
 # --------------------------------------------------------------------------
 # Lightning Address (LUD-16 / LNURL-pay) — ex.: voce@walletofsatoshi.com
 # --------------------------------------------------------------------------
-# user: a-z0-9-_. (LUD-16); domain: rótulos alfanuméricos + TLD de letras
-# (cobre também .onion). Validação de formato apenas; a resolução real é
-# feita em atm_core via HTTP.
+# user: a-z0-9-_. (LUD-16); domain: rótulos alfanuméricos + TLD de letras.
+# Validação de FORMATO apenas — a resolução real é feita em atm_core via HTTPS,
+# onde destinos inalcançáveis (entre eles .onion, que o ATM não roteia) são
+# recusados antes de qualquer pagamento.
 _LN_ADDRESS_RE = re.compile(
     r'^[a-z0-9._-]+@([a-z0-9-]+\.)+[a-z]{2,}$', re.IGNORECASE)
 
