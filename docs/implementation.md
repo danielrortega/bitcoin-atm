@@ -43,6 +43,21 @@ Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviad
 
 Tudo que roda antes do POST — ler o `config.ini`, ler `/etc/atm/key`, descriptografar o token, resolver um Lightning Address — está envolvido por `_not_broadcast_on_error`, que converte qualquer exceção inesperada em `PaymentNotBroadcast`. Sem isso, um erro de configuração (chave ausente ou rotacionada) escapava como `FileNotFoundError`/`InvalidToken`, era tratado como ambíguo e a transação do cliente não era nem enviada nem preservada. Exceções já classificadas passam intactas, para que um `PaymentUncertain` nunca seja rebaixado.
 
+### Validação do destino
+
+O endereço on-chain e a invoice BOLT11 são validados por checksum (Base58Check,
+Bech32/Bech32m) **e contra a rede configurada** em `[btcpay] network`. Sem essa
+amarração, um ATM de mainnet aceitava um `tb1...` escaneado por engano: o
+cliente já tinha posto o dinheiro na máquina e o erro só aparecia quando o
+BTCPay recusasse o envio.
+
+A rede é lida uma vez, na inicialização da janela — a validação roda a cada
+caractere digitado ou lido do QR e não pode reabrir o `config.ini` a cada um.
+Valor ausente ou desconhecido cai em `mainnet`, e uma rede desconhecida recusa
+todos os endereços (falha fechada). Testnet e regtest compartilham os mesmos
+version bytes Base58, então só os endereços SegWit (`tb1` vs `bcrt1`)
+distinguem essas duas.
+
 ### Aceitação de cédulas
 
 - **Whitelist de denominações**: só valores reais de cédulas BRL (2, 5, 10, 20,
@@ -201,6 +216,7 @@ operador reembolsa o cliente ou corrige o destino e reprocessa manualmente
 | `store_id` | `btcpay` | ID da loja no BTCPay |
 | `api_token` | `btcpay` | Token Fernet-criptografado |
 | `currency` | `btcpay` | Moeda fiduciária (ex.: `BRL`) |
+| `network` | `btcpay` | `mainnet` (padrão), `testnet` (cobre signet) ou `regtest`. Define quais endereços/invoices a GUI aceita |
 | `crypto_code` | `btcpay` | Código da cripto (ex.: `BTC`) |
 | `onchain_payment_method` | `btcpay` | (Opcional) Sobrescreve `BTC-CHAIN` |
 | `serial_port` | `hardware` | Porta serial do noteiro (ex.: `/dev/ttyUSB0`) |

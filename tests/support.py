@@ -244,6 +244,7 @@ def make_window(polls=(), max_transaction_brl=1000, **overrides):
     win = atm_gui.BTMWindow.__new__(atm_gui.BTMWindow)
     win.note_reader = FakeNoteReader(polls)
     win.max_transaction_brl = max_transaction_brl
+    win.network = 'mainnet'
     win.amount_brl = None
     win.start_time = None
     win.destination = None

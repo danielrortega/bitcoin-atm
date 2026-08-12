@@ -3,6 +3,12 @@ host = https://your.btcpay.server
 store_id = your_store_id
 api_token = encrypted_api_token_here
 currency = BRL
+; Rede em que este ATM opera: mainnet, testnet (cobre signet) ou regtest.
+; Define quais endereços e invoices a tela aceita — um ATM de mainnet recusa
+; um endereço de testnet escaneado por engano, em vez de aceitar o dinheiro e
+; só falhar na hora do envio. PRECISA bater com a rede da carteira do BTCPay.
+; Ausente ou inválida, assume mainnet (o lado seguro para errar).
+network = mainnet
 ; Código da cripto usada no BTCPay (normalmente BTC). Usado nos endpoints
 ; on-chain e Lightning. Para testnet o cryptoCode continua sendo BTC.
 crypto_code = BTC

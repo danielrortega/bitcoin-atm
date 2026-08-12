@@ -5,8 +5,8 @@ import qrcode
 import requests
 from PIL import Image
 
-from btc_address import (validate_bitcoin_address, validate_lightning_invoice,
-                         validate_lightning_address)
+from btc_address import (DEFAULT_NETWORK, validate_bitcoin_address,
+                         validate_lightning_invoice, validate_lightning_address)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
 
@@ -21,14 +21,15 @@ def generate_qr_code(data):
     return "/tmp/qr.png"
 
 
-def is_valid_bitcoin_address(address):
-    # Validação completa com checksum (Base58Check / Bech32 / Bech32m).
-    return validate_bitcoin_address(address)
+def is_valid_bitcoin_address(address, network=DEFAULT_NETWORK):
+    # Validação completa com checksum (Base58Check / Bech32 / Bech32m),
+    # exigindo a rede configurada.
+    return validate_bitcoin_address(address, network)
 
 
-def is_valid_lightning_invoice(invoice):
-    # Validação do checksum bech32 da invoice BOLT11.
-    return validate_lightning_invoice(invoice)
+def is_valid_lightning_invoice(invoice, network=DEFAULT_NETWORK):
+    # Validação do checksum bech32 da invoice BOLT11, exigindo a rede.
+    return validate_lightning_invoice(invoice, network)
 
 
 def is_valid_lightning_address(address):
@@ -36,11 +37,13 @@ def is_valid_lightning_address(address):
     return validate_lightning_address(address)
 
 
-def is_valid_lightning_destination(destination):
+def is_valid_lightning_destination(destination, network=DEFAULT_NETWORK):
     """Aceita os dois formatos de destino Lightning: uma invoice BOLT11
     (lnbc.../lntb...) ou um Lightning Address (user@domain). O Lightning
-    Address é resolvido para uma invoice no momento do pagamento."""
-    return (validate_lightning_invoice(destination)
+    Address é resolvido para uma invoice no momento do pagamento — e a invoice
+    resolvida não é checada contra a rede aqui, mas o provedor LNURL só emite
+    invoices da rede dele e o BTCPay recusaria uma de outra rede."""
+    return (validate_lightning_invoice(destination, network)
             or validate_lightning_address(destination))
 
 

@@ -16,7 +16,8 @@ import telegram_send
 from cryptography.fernet import Fernet
 from escpos.printer import Usb
 
-from btc_address import decode_bolt11_amount_msats, validate_lightning_address
+from btc_address import (DEFAULT_NETWORK, NETWORKS, decode_bolt11_amount_msats,
+                         validate_lightning_address)
 
 _LOG_PATH = '/var/log/btc_atm.log'
 _LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
@@ -160,6 +161,25 @@ def get_max_transaction_brl():
         logging.info("max_transaction_brl não configurado; usando %s",
                      _DEFAULT_MAX_TX_BRL)
     return _DEFAULT_MAX_TX_BRL
+
+
+def get_network():
+    """Rede Bitcoin em que este ATM opera ([btcpay] network no config.ini):
+    'mainnet', 'testnet' (cobre signet) ou 'regtest'.
+
+    Define quais endereços e invoices a GUI aceita. Config ausente ou valor
+    desconhecido caem em mainnet — recusar um endereço de teste é o lado
+    seguro para errar; o contrário aceitaria dinheiro de verdade rumo a um
+    destino que o BTCPay vai rejeitar."""
+    try:
+        value = _load_config()['btcpay']['network'].strip().lower()
+        if value in NETWORKS:
+            return value
+        logging.warning("network inválida (%s); usando %s. Válidas: %s",
+                        value, DEFAULT_NETWORK, ', '.join(NETWORKS))
+    except Exception:
+        logging.info("network não configurada; usando %s", DEFAULT_NETWORK)
+    return DEFAULT_NETWORK
 
 
 def _get_api_token():

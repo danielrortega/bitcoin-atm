@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
 from PyQt5.QtCore import QTimer, Qt, QThreadPool, QRunnable, QObject, pyqtSignal
 from PyQt5.QtGui import QFont
 from atm_core import (init_note_reader, get_btc_rate, get_max_transaction_brl,
-                      send_onchain_payment, send_lightning_payment,
+                      get_network, send_onchain_payment, send_lightning_payment,
                       print_receipt, enqueue_transaction, brl_to_btc,
                       PaymentNotBroadcast)
 from utils import is_valid_bitcoin_address, is_valid_lightning_destination
@@ -139,6 +139,9 @@ class BTMWindow(QMainWindow):
         # Inicializar variáveis
         self.note_reader = init_note_reader()
         self.max_transaction_brl = get_max_transaction_brl()
+        # Lida uma vez: a validação roda a cada tecla digitada / caractere
+        # lido do leitor de QR, e não pode reabrir o config.ini a cada uma.
+        self.network = get_network()
         self.amount_brl = None
         self.start_time = None
         self.rate_start_time = 0
@@ -373,8 +376,10 @@ class BTMWindow(QMainWindow):
             self.confirm_button.setEnabled(False)
             return
         valid = (
-            (self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination))
-            or (self.payment_type == "lightning" and is_valid_lightning_destination(self.destination))
+            (self.payment_type == "onchain"
+             and is_valid_bitcoin_address(self.destination, self.network))
+            or (self.payment_type == "lightning"
+                and is_valid_lightning_destination(self.destination, self.network))
         )
         if valid:
             self.status_label.setText(f"Endereço detectado: {self.destination[:10]}...")
@@ -400,14 +405,16 @@ class BTMWindow(QMainWindow):
             self.reset()
             return
 
-        # Valida o destino (checksum) antes de qualquer envio. Rápido, na GUI.
+        # Valida o destino (checksum e rede) antes de qualquer envio. Rápido,
+        # na GUI.
         if self.payment_type == "onchain":
-            valid = is_valid_bitcoin_address(self.destination)
+            valid = is_valid_bitcoin_address(self.destination, self.network)
         else:
-            valid = is_valid_lightning_destination(self.destination)
+            valid = is_valid_lightning_destination(self.destination, self.network)
         if not valid:
             QMessageBox.warning(self, "Endereço inválido",
-                "Endereço/invoice inválido para o método escolhido.")
+                "Endereço/invoice inválido para o método escolhido, "
+                f"ou de outra rede (este ATM opera em {self.network}).")
             self.reset()
             return
 
