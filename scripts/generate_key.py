@@ -7,8 +7,8 @@ _KEY_PATH = '/etc/atm/key'
 
 if __name__ == "__main__":
     # Nunca sobrescrever uma chave existente: isso tornaria o api_token já
-    # criptografado impossível de decifrar (e o erro de decriptação seria
-    # classificado como falha "incerta", sem reenfileirar a transação).
+    # criptografado impossível de decifrar, e o ATM não conseguiria pagar até
+    # o token ser re-encriptado (as transações ficam acumuladas na fila).
     if os.path.exists(_KEY_PATH):
         sys.exit(
             f"ERRO: {_KEY_PATH} já existe. Sobrescrever a chave tornaria o "

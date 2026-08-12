@@ -135,13 +135,15 @@ class TestRegistroParaReconciliacao(BaseDesfecho):
 
 
 class TestErroDeConfiguracaoNaGui(BaseDesfecho):
-    """ACHADO 1 DA REVISÃO, cadeia completa — falha esperada até a correção.
+    """Cadeia completa, do worker ao handler.
 
-    Exercita o caminho real: _execute_payment roda na thread de trabalho e
-    levanta; o que ele levanta decide se o dinheiro do cliente é preservado.
-    Um config.ini ilegível prova que nada foi transmitido (o mock de rede
-    confirma), mas hoje escapa como exceção crua, cai no ramo genérico da GUI
-    e a transação não é enfileirada."""
+    _execute_payment roda na thread de trabalho; a exceção que ele levanta é o
+    que decide se o dinheiro do cliente é preservado. Um config.ini ilegível
+    prova que nada foi transmitido (o mock de rede confirma), chega à GUI como
+    PaymentNotBroadcast e a transação é enfileirada.
+
+    Antes da correção do achado 1, escapava como exceção crua, caía no ramo
+    genérico do handler e a transação era perdida."""
 
     def executar_com_config_quebrada(self):
         """Roda _execute_payment como o worker roda e devolve a exceção."""
@@ -155,14 +157,14 @@ class TestErroDeConfiguracaoNaGui(BaseDesfecho):
         post.assert_not_called()
         return ctx.exception
 
-    def test_hoje_erro_generico_nao_enfileira(self):
-        """Fixa o comportamento atual do handler: correto para erros pós-envio,
-        errado para os pré-envio, que hoje chegam aqui indistinguíveis."""
+    def test_erro_generico_nao_enfileira(self):
+        """O ramo conservador continua valendo para o que resta de
+        desconhecido — erros DEPOIS de o pagamento partir, quando o Bitcoin
+        pode já ter saído."""
         win = self.janela_em_pagamento()
         win._on_payment_error(RuntimeError('qualquer coisa'))
         self.enfileirar.assert_not_called()
 
-    @unittest.expectedFailure
     def test_config_ilegivel_preserva_a_transacao(self):
         exc = self.executar_com_config_quebrada()
         win = self.janela_em_pagamento(amount=150)

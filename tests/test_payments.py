@@ -273,79 +273,64 @@ class TestContratoLightning(BaseBTCPay):
 
 
 class TestErroAntesDoBroadcast(BaseBTCPay):
-    """ACHADO 1 DA REVISÃO — falhas esperadas até a correção.
+    """Falhas de preparação (config.ini, /etc/atm/key, token Fernet).
 
-    Tudo que roda antes do POST (ler config, ler /etc/atm/key, descriptografar
-    o token) prova que NADA foi transmitido. Hoje essas falhas escapam como
-    exceção crua e o chamador as trata como ambíguas:
+    Tudo isso roda ANTES do POST, então prova que nada foi transmitido — cada
+    teste confirma as duas metades: a rede nunca foi tocada E o erro chega
+    classificado como PaymentNotBroadcast, para que a transação seja
+    preservada na fila.
 
-      - GUI:  ramo 'else' de _on_payment_error -> não enfileira, dinheiro some.
-      - Fila: 'except Exception' -> transação descartada sem reenfileirar.
-
-    O próprio scripts/generate_key.py descreve esse defeito num comentário.
-
-    Correção prevista: envolver a preparação do pagamento e levantar
-    PaymentNotBroadcast."""
+    Antes da correção (_not_broadcast_on_error em atm_core), essas falhas
+    escapavam como FileNotFoundError/InvalidToken/KeyError e o chamador as
+    tratava como ambíguas: a GUI não enfileirava e a fila descartava a
+    transação. O cliente pagava em dinheiro e ficava sem nada, por um erro de
+    configuração que nem chegou a tentar pagar. O comentário no topo de
+    scripts/generate_key.py descrevia exatamente esse defeito."""
 
     def _sem_rede(self):
         return mock.patch.object(
             atm_core.requests, 'post',
             side_effect=AssertionError('não deveria chegar à rede'))
 
-    # --- fatos que já valem hoje: nada é transmitido nesses cenários ---
-    def test_chave_ausente_nao_chega_a_rede(self):
+    def test_chave_fernet_ausente(self):
+        """Cenário real: /etc/atm/key não montado depois de um boot."""
         os.remove(self.key_path)
         with self._sem_rede() as post:
-            with self.assertRaises(Exception):
-                atm_core.send_onchain_payment(100, ENDERECO, 500000)
-        post.assert_not_called()
-
-    def test_token_invalido_nao_chega_a_rede(self):
-        with open(self.key_path, 'wb') as f:
-            f.write(Fernet.generate_key())  # chave rotacionada
-        with self._sem_rede() as post:
-            with self.assertRaises(Exception):
-                atm_core.send_onchain_payment(100, ENDERECO, 500000)
-        post.assert_not_called()
-
-    def test_config_incompleta_nao_chega_a_rede(self):
-        with open(self.config_path, 'w') as f:
-            f.write('[outra_secao]\nx = 1\n')
-        with self._sem_rede() as post:
-            with self.assertRaises(Exception):
-                atm_core.send_onchain_payment(100, ENDERECO, 500000)
-        post.assert_not_called()
-
-    # --- classificação: o que deveria acontecer ---
-    @unittest.expectedFailure
-    def test_chave_ausente_e_nao_transmitido(self):
-        os.remove(self.key_path)
-        with self._sem_rede():
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core.send_onchain_payment(100, ENDERECO, 500000)
+        post.assert_not_called()
 
-    @unittest.expectedFailure
-    def test_token_invalido_e_nao_transmitido(self):
+    def test_chave_rotacionada_nao_decifra_o_token(self):
         with open(self.key_path, 'wb') as f:
             f.write(Fernet.generate_key())
-        with self._sem_rede():
+        with self._sem_rede() as post:
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core.send_onchain_payment(100, ENDERECO, 500000)
+        post.assert_not_called()
 
-    @unittest.expectedFailure
-    def test_config_incompleta_e_nao_transmitido(self):
+    def test_config_sem_a_secao_btcpay(self):
         with open(self.config_path, 'w') as f:
             f.write('[outra_secao]\nx = 1\n')
-        with self._sem_rede():
+        with self._sem_rede() as post:
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core.send_onchain_payment(100, ENDERECO, 500000)
+        post.assert_not_called()
 
-    @unittest.expectedFailure
-    def test_lightning_com_chave_ausente_e_nao_transmitido(self):
+    def test_lightning_tem_a_mesma_protecao(self):
         os.remove(self.key_path)
-        with self._sem_rede():
+        with self._sem_rede() as post:
             with self.assertRaises(atm_core.PaymentNotBroadcast):
                 atm_core.send_lightning_payment(100, support.make_invoice(), 500000)
+        post.assert_not_called()
+
+    def test_falha_ambigua_nao_e_rebaixada(self):
+        """A proteção não pode engolir uma classificação já feita: rebaixar um
+        PaymentUncertain para PaymentNotBroadcast faria a transação voltar
+        para a fila e ser paga duas vezes."""
+        with mock.patch.object(atm_core.requests, 'post',
+                               side_effect=requests.Timeout('estourou')):
+            with self.assertRaises(atm_core.PaymentUncertain):
+                atm_core.send_onchain_payment(100, ENDERECO, 500000)
 
 
 class TestRecibo(unittest.TestCase):

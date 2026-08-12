@@ -36,10 +36,12 @@ O padrão usado é `_Worker(_WorkerSignals)` com sinais `result`, `error` e `fin
 
 | Exceção | Significado | Ação |
 |---|---|---|
-| `PaymentNotBroadcast` | Certamente NÃO foi transmitido (sem conexão, 4xx) | Seguro enfileirar |
+| `PaymentNotBroadcast` | Certamente NÃO foi transmitido (sem conexão, 4xx, erro de preparação) | Seguro enfileirar |
 | `PaymentUncertain` | Resultado ambíguo (timeout, 5xx) | **Não reenfileirar** — operador confere manualmente |
 
 Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviado, a transação é descartada da fila com um log de erro e o operador deve verificar a carteira no BTCPay Server.
+
+Tudo que roda antes do POST — ler o `config.ini`, ler `/etc/atm/key`, descriptografar o token, resolver um Lightning Address — está envolvido por `_not_broadcast_on_error`, que converte qualquer exceção inesperada em `PaymentNotBroadcast`. Sem isso, um erro de configuração (chave ausente ou rotacionada) escapava como `FileNotFoundError`/`InvalidToken`, era tratado como ambíguo e a transação do cliente não era nem enviada nem preservada. Exceções já classificadas passam intactas, para que um `PaymentUncertain` nunca seja rebaixado.
 
 ### Aceitação de cédulas
 

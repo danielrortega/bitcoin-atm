@@ -186,11 +186,11 @@ class TestClassificacaoNaFila(BaseFila):
         self.assertEqual(self.ler_fila(), [])
 
     def test_excecao_inesperada_e_descartada(self):
-        """FIXA O COMPORTAMENTO ATUAL. É conservador para erros pós-envio, mas
-        hoje engole também os erros PRÉ-envio (achado 1: config/chave Fernet),
-        que provadamente nada transmitiram e deveriam voltar para a fila.
-        Ao corrigir a classificação em atm_core, este teste deve passar a
-        exigir o reenfileiramento."""
+        """Conservador de propósito: uma exceção desconhecida pode ter vindo
+        DEPOIS de o pagamento partir, e reenfileirar pagaria duas vezes.
+
+        Os erros de preparação (config, chave Fernet) não caem mais aqui —
+        chegam como PaymentNotBroadcast e voltam para a fila (achado 1)."""
         self.instalar_envio(onchain=self.falha(KeyError('btcpay')))
         self.escrever_fila([self.tx()])
         atm_core.process_offline_queue()

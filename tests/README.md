@@ -24,7 +24,7 @@ impressora, janela ou conexão de rede.
 A saída normal hoje é:
 
 ```
-OK (expected failures=11)
+OK (expected failures=6)
 ```
 
 Cada `@unittest.expectedFailure` documenta um bug conhecido, com a correção
@@ -32,7 +32,6 @@ prevista no docstring da classe:
 
 | Testes | Achado |
 |---|---|
-| `test_payments.TestErroAntesDoBroadcast`<br>`test_gui_resultado.TestErroDeConfiguracaoNaGui` | Erro antes do POST (config, chave Fernet) escapa como exceção crua e é tratado como "incerto": a transação não é enfileirada nem reenfileirada, e o dinheiro do cliente se perde. |
 | `test_notes.TestFramePartido` | Quadro de cédula partido entre dois polls de 1s é descartado pelas duas metades: a nota está na máquina e nada é creditado. |
 | `test_notes.TestNotaEngolidaDuranteOPagamento` | Cédula inserida durante o envio é descartada sem nenhum registro para reembolso. |
 | `test_gui_resultado.TestRegistroParaReconciliacao` | Falha incerta e falha de enfileiramento só produzem uma caixa de diálogo; não há log com valor e destino para reconciliar. |
@@ -41,6 +40,13 @@ prevista no docstring da classe:
 **Ao corrigir um desses bugs, remova o `@unittest.expectedFailure`.** Se
 esquecer, o `unittest` reporta `UNEXPECTED SUCCESS` e o run termina com código
 de saída 1 — a correção não passa despercebida.
+
+Já corrigido por este caminho: erro antes do POST (config ilegível, chave
+Fernet ausente ou rotacionada) escapava como exceção crua e era tratado como
+resultado ambíguo, então a transação não era enfileirada nem reenfileirada e o
+dinheiro do cliente se perdia. Hoje é `PaymentNotBroadcast` — ver
+`test_payments.TestErroAntesDoBroadcast` e
+`test_gui_resultado.TestErroDeConfiguracaoNaGui`.
 
 ## Convenção
 

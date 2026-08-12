@@ -1,4 +1,5 @@
 import configparser
+import contextlib
 import ipaddress
 import json
 import logging
@@ -55,6 +56,31 @@ class PaymentUncertain(Exception):
     antes de qualquer reenvio, para evitar gasto duplo."""
 
 
+@contextlib.contextmanager
+def _not_broadcast_on_error(context):
+    """Classifica como PaymentNotBroadcast qualquer falha ocorrida ANTES do
+    POST de pagamento.
+
+    Ler o config.ini, ler /etc/atm/key e descriptografar o token acontecem
+    antes de qualquer byte ir para a rede. Se falharem, o Bitcoin com certeza
+    não saiu e a transação pode ser enfileirada com segurança.
+
+    Sem isto, uma chave ausente ou rotacionada escapava como
+    FileNotFoundError/InvalidToken — e tanto a GUI quanto a fila tratam
+    exceção desconhecida como resultado AMBÍGUO, que por segurança não é
+    reenfileirado. O cliente pagava em dinheiro e ficava sem o Bitcoin e sem
+    registro, por um erro de configuração que nem chegou a tentar pagar.
+
+    Exceções já classificadas passam intactas: rebaixar um PaymentUncertain
+    para PaymentNotBroadcast reintroduziria o risco de gasto duplo."""
+    try:
+        yield
+    except (PaymentNotBroadcast, PaymentUncertain):
+        raise
+    except Exception as e:
+        raise PaymentNotBroadcast(f"{context}: {e}") from e
+
+
 def brl_to_btc(amount_brl, rate):
     """Converte BRL->BTC com precisão decimal, arredondando para baixo
     (ROUND_DOWN) para nunca enviar mais do que o cliente pagou."""
@@ -66,8 +92,12 @@ def _post_payment(url, payload):
     """POST de pagamento com classificação do resultado para segurança
     financeira. Levanta PaymentNotBroadcast (seguro reenfileirar) ou
     PaymentUncertain (não reenfileirar) conforme o tipo de falha."""
+    # Montar o header lê a config e descriptografa o token — ainda antes da
+    # rede, portanto uma falha aqui é comprovadamente não-transmitida.
+    with _not_broadcast_on_error("falha ao montar as credenciais do BTCPay"):
+        headers = _btcpay_headers()
     try:
-        resp = requests.post(url, headers=_btcpay_headers(), json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
     except requests.ConnectionError as e:
         raise PaymentNotBroadcast(f"sem conexão: {e}") from e
     except requests.Timeout as e:
@@ -164,24 +194,25 @@ def get_btc_rate():
 
 
 def send_onchain_payment(amount_brl, address, rate):
-    cfg = _load_config()
-    host = cfg['btcpay']['host'].rstrip('/')
-    store_id = cfg['btcpay']['store_id']
-    crypto = cfg['btcpay'].get('crypto_code', 'BTC')
-    # Path correto do Greenfield atual: payment-methods/{BTC-CHAIN}/wallet/...
-    # (o antigo /on-chain/{cryptoCode}/transactions retorna 404). Permite
-    # sobrescrever via config para instâncias mais antigas.
-    pm = cfg['btcpay'].get('onchain_payment_method', f'{crypto}-CHAIN')
-    amount_btc = brl_to_btc(amount_brl, rate)
-    url = f"{host}/api/v1/stores/{store_id}/payment-methods/{pm}/wallet/transactions"
-    payload = {
-        'destinations': [
-            {'destination': address, 'amount': str(amount_btc), 'subtractFromAmount': False}
-        ],
-        'noChange': False,
-        # 'feerate' é omitido de propósito: enviar null pode causar 422.
-        # Ausência → estimativa automática de taxa pelo BTCPay.
-    }
+    with _not_broadcast_on_error("falha ao preparar o pagamento on-chain"):
+        cfg = _load_config()
+        host = cfg['btcpay']['host'].rstrip('/')
+        store_id = cfg['btcpay']['store_id']
+        crypto = cfg['btcpay'].get('crypto_code', 'BTC')
+        # Path correto do Greenfield atual: payment-methods/{BTC-CHAIN}/wallet/...
+        # (o antigo /on-chain/{cryptoCode}/transactions retorna 404). Permite
+        # sobrescrever via config para instâncias mais antigas.
+        pm = cfg['btcpay'].get('onchain_payment_method', f'{crypto}-CHAIN')
+        amount_btc = brl_to_btc(amount_brl, rate)
+        url = f"{host}/api/v1/stores/{store_id}/payment-methods/{pm}/wallet/transactions"
+        payload = {
+            'destinations': [
+                {'destination': address, 'amount': str(amount_btc), 'subtractFromAmount': False}
+            ],
+            'noChange': False,
+            # 'feerate' é omitido de propósito: enviar null pode causar 422.
+            # Ausência → estimativa automática de taxa pelo BTCPay.
+        }
     resp = _post_payment(url, payload)
     # 2xx = transmitido. Daqui em diante o parsing nunca pode levantar.
     txid = _safe_json_field(resp, 'transactionHash')
@@ -307,19 +338,20 @@ def _lnurl_get_json(url, context):
 
 
 def send_lightning_payment(amount_brl, destination, rate):
-    cfg = _load_config()
-    host = cfg['btcpay']['host'].rstrip('/')
-    store_id = cfg['btcpay']['store_id']
-    crypto = cfg['btcpay'].get('crypto_code', 'BTC')
-    amount_btc = brl_to_btc(amount_brl, rate)
-    # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
-    # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
-    if validate_lightning_address(destination):
-        invoice = _resolve_lightning_address(destination, amount_btc)
-    else:
-        invoice = destination
-    url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
-    payload = {'BOLT11': invoice}
+    with _not_broadcast_on_error("falha ao preparar o pagamento Lightning"):
+        cfg = _load_config()
+        host = cfg['btcpay']['host'].rstrip('/')
+        store_id = cfg['btcpay']['store_id']
+        crypto = cfg['btcpay'].get('crypto_code', 'BTC')
+        amount_btc = brl_to_btc(amount_brl, rate)
+        # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
+        # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
+        if validate_lightning_address(destination):
+            invoice = _resolve_lightning_address(destination, amount_btc)
+        else:
+            invoice = destination
+        url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
+        payload = {'BOLT11': invoice}
     resp = _post_payment(url, payload)
     # 200 = Complete, 202 = Pending. Lê o status sem deixar o parsing levantar.
     data = {}
