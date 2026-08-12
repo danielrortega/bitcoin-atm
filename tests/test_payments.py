@@ -49,7 +49,7 @@ class BaseBTCPay(unittest.TestCase):
         with open(self.key_path, 'wb') as f:
             f.write(key)
         self.cifrado = Fernet(key).encrypt(self.API_TOKEN.encode()).decode()
-        self.config_path = self.escrever_config(api_token=self.cifrado)
+        self.config_path = self.escrever_config(valor_cifrado=self.cifrado)
 
         for alvo, valor in (('_CONFIG_PATH', self.config_path),
                             ('_KEY_PATH', self.key_path)):
@@ -64,13 +64,18 @@ class BaseBTCPay(unittest.TestCase):
         self.telegram = p.start()
         self.addCleanup(p.stop)
 
-    def escrever_config(self, api_token, extra=''):
+    def escrever_config(self, valor_cifrado, extra=''):
+        """Escreve um config.ini de teste num diretório temporário.
+
+        `valor_cifrado` é o texto CIFRADO com Fernet, que é exatamente o que o
+        config.ini de produção guarda — o token em claro nunca é escrito em
+        lugar nenhum, nem aqui nem em produção."""
         path = os.path.join(self.dir, 'config.ini')
         with open(path, 'w') as f:
             f.write('[btcpay]\n'
                     'host = https://btcpay.exemplo/\n'
                     'store_id = loja1\n'
-                    f'api_token = {api_token}\n'
+                    f'api_token = {valor_cifrado}\n'
                     'currency = BRL\n'
                     'crypto_code = BTC\n' + extra)
         return path
@@ -186,7 +191,7 @@ class TestContratoOnchain(BaseBTCPay):
                          f'token {self.API_TOKEN}')
 
     def test_payment_method_pode_ser_sobrescrito_pela_config(self):
-        self.escrever_config(api_token=self.cifrado,
+        self.escrever_config(valor_cifrado=self.cifrado,
                              extra='onchain_payment_method = BTC\n')
         args, _ = self.enviar()
         self.assertIn('/payment-methods/BTC/wallet/', args[0])
