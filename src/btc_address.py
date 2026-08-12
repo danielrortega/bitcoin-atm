@@ -7,7 +7,11 @@ Implementação em Python puro (sem dependências externas) de:
 - Validação de Lightning Address (user@domain, LUD-16/LNURL-pay)
 - Decodificação do valor (msats) codificado no HRP de uma invoice BOLT11
 
-Aceita redes mainnet e testnet/signet/regtest (a POC roda em testnet).
+A rede (mainnet, testnet/signet ou regtest) vem da configuração e é exigida na
+validação: um ATM de mainnet recusa um endereço de testnet escaneado por
+engano, em vez de aceitar o dinheiro e só descobrir o problema quando o BTCPay
+recusar o envio.
+
 A validação por checksum protege contra endereços digitados/escaneados
 incorretamente — algo que a checagem por prefixo anterior não fazia.
 """
@@ -16,14 +20,26 @@ import hashlib
 import re
 from decimal import Decimal
 
+# Redes suportadas. 'testnet' cobre também signet, que usa os mesmos version
+# bytes e o mesmo HRP ('tb'). O padrão é mainnet: se a configuração não disser
+# a rede, recusar endereços de teste é o lado seguro para errar num caixa que
+# opera dinheiro de verdade.
+NETWORKS = ('mainnet', 'testnet', 'regtest')
+DEFAULT_NETWORK = 'mainnet'
+
 # --------------------------------------------------------------------------
 # Base58Check (BIP- legado)
 # --------------------------------------------------------------------------
 _B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 _B58_MAP = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
-# Version bytes aceitos: P2PKH/P2SH em mainnet e testnet.
-_BASE58_VERSIONS = {0x00, 0x05, 0x6F, 0xC4}
+# Version bytes por rede: P2PKH e P2SH. Testnet e signet compartilham os
+# mesmos bytes; regtest também.
+_BASE58_VERSIONS = {
+    'mainnet': frozenset({0x00, 0x05}),
+    'testnet': frozenset({0x6F, 0xC4}),
+    'regtest': frozenset({0x6F, 0xC4}),
+}
 
 
 def _b58check_decode(s):
@@ -47,11 +63,11 @@ def _b58check_decode(s):
     return data
 
 
-def _valid_base58_address(addr):
+def _valid_base58_address(addr, versions):
     data = _b58check_decode(addr)
     if data is None or len(data) != 21:
         return False
-    return data[0] in _BASE58_VERSIONS
+    return data[0] in versions
 
 
 # --------------------------------------------------------------------------
@@ -60,7 +76,12 @@ def _valid_base58_address(addr):
 _BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
 _BECH32_CONST = 1
 _BECH32M_CONST = 0x2bc830a3
-_SEGWIT_HRPS = {'bc', 'tb', 'bcrt'}
+# HRP SegWit por rede. Signet usa 'tb', como a testnet.
+_SEGWIT_HRPS = {
+    'mainnet': frozenset({'bc'}),
+    'testnet': frozenset({'tb'}),
+    'regtest': frozenset({'bcrt'}),
+}
 
 
 def _bech32_polymod(values):
@@ -136,9 +157,9 @@ def _convertbits(data, frombits, tobits, pad=True):
     return ret
 
 
-def _valid_segwit_address(addr):
+def _valid_segwit_address(addr, hrps):
     hrp, data, spec = _bech32_decode(addr)
-    if hrp is None or hrp not in _SEGWIT_HRPS or not data:
+    if hrp is None or hrp not in hrps or not data:
         return False
     witver = data[0]
     if witver > 16:
@@ -159,9 +180,16 @@ def _valid_segwit_address(addr):
 # --------------------------------------------------------------------------
 # API pública
 # --------------------------------------------------------------------------
-def validate_bitcoin_address(address):
-    """True se for um endereço Bitcoin válido (checksum verificado),
-    em qualquer rede (mainnet/testnet/signet/regtest)."""
+def validate_bitcoin_address(address, network=DEFAULT_NETWORK):
+    """True se for um endereço Bitcoin válido (checksum verificado) DA REDE
+    informada ('mainnet', 'testnet' — que cobre signet — ou 'regtest').
+
+    A rede importa: sem amarrá-la, um ATM de mainnet aceitava um endereço de
+    testnet escaneado por engano. O BTCPay recusaria o envio, mas só depois de
+    o cliente ter posto o dinheiro na máquina.
+
+    Uma rede desconhecida recusa tudo (falha fechada). Quem lê a configuração
+    é atm_core.get_network(), que normaliza o valor e avisa no log."""
     if not isinstance(address, str):
         return False
     addr = address.strip()
@@ -170,17 +198,25 @@ def validate_bitcoin_address(address):
     # thread da GUI (DoS do quiosque). O caminho bech32 já tem seu próprio teto.
     if not addr or len(addr) > 100:
         return False
-    return _valid_segwit_address(addr) or _valid_base58_address(addr)
+    return (_valid_segwit_address(addr, _SEGWIT_HRPS.get(network, frozenset()))
+            or _valid_base58_address(addr,
+                                     _BASE58_VERSIONS.get(network, frozenset())))
 
 
-def validate_lightning_invoice(invoice):
-    """True se for uma invoice BOLT11 com prefixo conhecido e checksum
-    bech32 válido. Não decodifica todos os campos BOLT11, mas o checksum
-    já protege contra erros de digitação/leitura."""
+def validate_lightning_invoice(invoice, network=DEFAULT_NETWORK):
+    """True se for uma invoice BOLT11 DA REDE informada, com checksum bech32
+    válido. Não decodifica todos os campos BOLT11, mas o checksum já protege
+    contra erros de digitação/leitura."""
     if not isinstance(invoice, str):
         return False
+    esperado = _BOLT11_NETWORK_PREFIX.get(network)
+    if esperado is None:
+        return False
     inv = invoice.strip().lower()
-    if not inv.startswith(('lnbc', 'lntb', 'lnbcrt')):
+    # O prefixo mais longo tem de ser identificado primeiro: 'lnbcrt'
+    # (regtest) começa com 'lnbc' (mainnet), então comparar por startswith
+    # aceitaria uma invoice de regtest num ATM de mainnet.
+    if next((p for p in _BOLT11_PREFIXES if inv.startswith(p)), None) != esperado:
         return False
     # BOLT11 é bech32 (não bech32m) e remove o limite de 90 caracteres.
     hrp, data, spec = _bech32_decode(inv, max_length=2000)
@@ -221,6 +257,11 @@ _BOLT11_MULTIPLIERS = {
 }
 # Ordem importa: 'lnbcrt' antes de 'lnbc' para casar o prefixo mais longo.
 _BOLT11_PREFIXES = ('lnbcrt', 'lntb', 'lnbc')
+_BOLT11_NETWORK_PREFIX = {
+    'mainnet': 'lnbc',
+    'testnet': 'lntb',
+    'regtest': 'lnbcrt',
+}
 _MSATS_PER_BTC = Decimal(100_000_000_000)  # 1 BTC = 1e8 sat = 1e11 msat
 
 

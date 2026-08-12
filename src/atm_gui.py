@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (QMainWindow, QLabel, QPushButton, QVBoxLayout,
 from PyQt5.QtCore import QTimer, Qt, QThreadPool, QRunnable, QObject, pyqtSignal
 from PyQt5.QtGui import QFont
 from atm_core import (init_note_reader, get_btc_rate, get_max_transaction_brl,
-                      send_onchain_payment, send_lightning_payment,
+                      get_network, send_onchain_payment, send_lightning_payment,
                       print_receipt, enqueue_transaction, brl_to_btc,
                       PaymentNotBroadcast)
 from utils import is_valid_bitcoin_address, is_valid_lightning_destination
@@ -139,12 +139,16 @@ class BTMWindow(QMainWindow):
         # Inicializar variáveis
         self.note_reader = init_note_reader()
         self.max_transaction_brl = get_max_transaction_brl()
+        # Lida uma vez: a validação roda a cada tecla digitada / caractere
+        # lido do leitor de QR, e não pode reabrir o config.ini a cada uma.
+        self.network = get_network()
         self.amount_brl = None
         self.start_time = None
         self.rate_start_time = 0
         self.operated_rate = None
         self.destination = None
         self.payment_type = None
+        self._note_buf = b''       # quadro incompleto aguardando o resto
 
         # Threading
         self.threadpool = QThreadPool()
@@ -236,7 +240,19 @@ class BTMWindow(QMainWindow):
             return
 
         if self._payment_in_flight:
-            return  # buffer já drenado; ignora qualquer entrada durante o envio
+            # O buffer já foi drenado acima (é o que evita a "nota fantasma"
+            # creditada logo após o reset), mas a cédula está FISICAMENTE
+            # dentro da máquina. Sem este registro, ela sumia sem deixar
+            # rastro: nem crédito para o cliente, nem informação para o
+            # operador reembolsar. Interpretar o valor aqui é o que torna o
+            # reembolso possível — creditar é que não se pode.
+            for note_value in self._parse_notes(data):
+                logging.critical(
+                    "Nota de R$%s inserida durante o envio e NÃO creditada. "
+                    "REEMBOLSO MANUAL NECESSÁRIO.", note_value)
+                self.instruction_label.setText(
+                    "Não insira notas durante o envio — procure o operador.")
+            return
 
         if data:
             for note_value in self._parse_notes(data):
@@ -287,30 +303,49 @@ class BTMWindow(QMainWindow):
                 "escolha o método de envio")
 
     def _parse_notes(self, data):
-        """Interpreta o buffer do noteiro como uma sequência de quadros de
+        """Interpreta o fluxo do noteiro como uma sequência de quadros de
         NOTE_FRAME_BYTES bytes, um por cédula, e valida cada valor contra as
         denominações reais de cédulas BRL.
 
-        O enquadramento importa: se duas notas chegam dentro da mesma janela
-        de leitura (1s), o buffer traz os dois quadros juntos. Interpretar o
-        buffer inteiro com um único int.from_bytes daria um valor absurdo —
-        que, sem whitelist, seria creditado como R$ milhões e convertido em
-        Bitcoin real; e, com whitelist, faria as DUAS notas serem engolidas
-        sem crédito. Lendo quadro a quadro, ambas são creditadas corretamente.
+        O enquadramento importa nas duas pontas:
 
-        Ruído elétrico e buffers desalinhados são descartados com log."""
-        if not data or len(data) % self.NOTE_FRAME_BYTES:
-            logging.warning("Buffer do noteiro desalinhado, descartado: %s",
-                            data.hex())
-            return []
+        - Duas notas na mesma janela de leitura (1s) chegam como dois quadros
+          no mesmo buffer. Interpretar o buffer inteiro com um único
+          int.from_bytes daria um valor absurdo — que, sem whitelist, seria
+          creditado como R$ milhões e convertido em Bitcoin real; e, com
+          whitelist, faria as DUAS notas serem engolidas sem crédito.
+
+        - Uma nota só pode ter o quadro PARTIDO entre duas leituras: nada
+          garante que os 2 bytes cheguem no mesmo poll. Descartar cada metade
+          por estar desalinhada engolia a cédula inteira, que já estava dentro
+          da máquina. Por isso o que sobra fica guardado para a leitura
+          seguinte, e não é descartado de imediato.
+
+        Um par de bytes que não corresponde a nenhuma denominação faz o fluxo
+        avançar UM byte e tentar de novo, em vez de descartar o par inteiro.
+        Essa ressincronização é o que impede um único byte de ruído de deslocar
+        todos os quadros seguintes — sem ela, cada cédula posterior seria lida
+        metade com metade, rejeitada pela whitelist e engolida em silêncio.
+
+        Ressincronizar não pode creditar uma nota que não existe: toda
+        denominação válida tem o byte alto 0x00, e uma leitura deslocada sempre
+        põe o byte baixo do quadro anterior nessa posição."""
+        buf = self._note_buf + data
         notes = []
-        for i in range(0, len(data), self.NOTE_FRAME_BYTES):
-            value = int.from_bytes(data[i:i + self.NOTE_FRAME_BYTES], "big")
+        while len(buf) >= self.NOTE_FRAME_BYTES:
+            quadro = buf[:self.NOTE_FRAME_BYTES]
+            value = int.from_bytes(quadro, "big")
             if value in self.VALID_DENOMINATIONS:
                 notes.append(value)
+                buf = buf[self.NOTE_FRAME_BYTES:]
             else:
-                logging.warning("Valor de nota inválido ignorado: %s (bytes=%s)",
-                                value, data[i:i + self.NOTE_FRAME_BYTES].hex())
+                logging.warning("Quadro inválido do noteiro (%s = %s); "
+                                "descartando 1 byte e ressincronizando.",
+                                quadro.hex(), value)
+                buf = buf[1:]
+        # Sobra no máximo NOTE_FRAME_BYTES-1 bytes: um quadro pela metade,
+        # que a próxima leitura completa.
+        self._note_buf = buf
         return notes
 
     def _on_address_changed(self, text):
@@ -341,8 +376,10 @@ class BTMWindow(QMainWindow):
             self.confirm_button.setEnabled(False)
             return
         valid = (
-            (self.payment_type == "onchain" and is_valid_bitcoin_address(self.destination))
-            or (self.payment_type == "lightning" and is_valid_lightning_destination(self.destination))
+            (self.payment_type == "onchain"
+             and is_valid_bitcoin_address(self.destination, self.network))
+            or (self.payment_type == "lightning"
+                and is_valid_lightning_destination(self.destination, self.network))
         )
         if valid:
             self.status_label.setText(f"Endereço detectado: {self.destination[:10]}...")
@@ -368,14 +405,16 @@ class BTMWindow(QMainWindow):
             self.reset()
             return
 
-        # Valida o destino (checksum) antes de qualquer envio. Rápido, na GUI.
+        # Valida o destino (checksum e rede) antes de qualquer envio. Rápido,
+        # na GUI.
         if self.payment_type == "onchain":
-            valid = is_valid_bitcoin_address(self.destination)
+            valid = is_valid_bitcoin_address(self.destination, self.network)
         else:
-            valid = is_valid_lightning_destination(self.destination)
+            valid = is_valid_lightning_destination(self.destination, self.network)
         if not valid:
             QMessageBox.warning(self, "Endereço inválido",
-                "Endereço/invoice inválido para o método escolhido.")
+                "Endereço/invoice inválido para o método escolhido, "
+                f"ou de outra rede (este ATM opera em {self.network}).")
             self.reset()
             return
 
@@ -425,6 +464,12 @@ class BTMWindow(QMainWindow):
                     f"Não foi possível enviar agora ({exc}).\n\n"
                     "A transação foi enfileirada e será processada automaticamente.")
             except Exception as enq:
+                # Pior caso do sistema: não enviou E não conseguiu enfileirar.
+                # O log é o único registro que sobra do que o cliente pagou.
+                logging.critical(
+                    "TRANSAÇÃO PERDIDA: R$%s para %s (%s) não foi enviada nem "
+                    "enfileirada. Envio: %s | Enfileiramento: %s",
+                    amount_brl, destination, payment_type, exc, enq)
                 self.status_label.setText("Erro ao enfileirar!")
                 self.status_label.setStyleSheet("color: red;")
                 QMessageBox.critical(self, "Erro",
@@ -432,7 +477,13 @@ class BTMWindow(QMainWindow):
         else:
             # Resultado AMBÍGUO (timeout/5xx) ou erro inesperado. O Bitcoin
             # pode já ter sido enviado: NÃO reenfileira, para evitar gasto
-            # duplo. Operador precisa conferir manualmente.
+            # duplo. Operador precisa conferir manualmente — e a mensagem na
+            # tela some no próximo cliente, então o registro tem que ficar no
+            # log, com o que basta para reconciliar com a carteira.
+            logging.critical(
+                "Pagamento com resultado INCERTO: R$%s para %s (%s). Confira a "
+                "carteira no BTCPay ANTES de reenviar (risco de gasto duplo). "
+                "Erro: %s", amount_brl, destination, payment_type, exc)
             self.status_label.setText("Falha incerta — verifique a carteira!")
             self.status_label.setStyleSheet("color: red;")
             QMessageBox.critical(self, "Verificação necessária",
@@ -449,6 +500,9 @@ class BTMWindow(QMainWindow):
         self.destination = None
         self.payment_type = None
         self._pending = None
+        # Um quadro pela metade não pode atravessar para o próximo cliente:
+        # combinado com os bytes dele, corromperia a leitura da primeira nota.
+        self._note_buf = b''
         self.instruction_label.setText("Insira uma nota no noteiro")
         self.status_label.setText("Aguardando...")
         self.status_label.setStyleSheet("color: black;")

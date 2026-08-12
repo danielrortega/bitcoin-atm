@@ -202,6 +202,11 @@ api_token = gAAAAAB...
 # Moeda fiduciária (deixe BRL para o Brasil)
 currency = BRL
 
+# Rede: mainnet, testnet (cobre signet) ou regtest. Precisa bater com a rede
+# da carteira do BTCPay. Define quais endereços a tela aceita — um ATM de
+# mainnet recusa endereço de testnet escaneado por engano. Ausente = mainnet.
+network = mainnet
+
 # Código da cripto no BTCPay (normalmente BTC, mesmo em testnet)
 crypto_code = BTC
 
@@ -370,6 +375,7 @@ python3 -c "import serial; s = serial.Serial('/tmp/ttyV0', 9600); s.write((50).t
 - Use carteiras testnet para on-chain (`tb1...`, `m...`, `n...`) e invoices Lightning (`lntb...`).
 - Obtenha tBTC (testnet Bitcoin) gratuitamente em faucets como `coinfaucet.eu` ou `testnet-faucet.com`.
 - O campo `crypto_code = BTC` no `config.ini` continua igual — o BTCPay identifica a rede pela configuração da carteira.
+- **Ajuste `network = testnet` no `config.ini`.** Sem isso o ATM assume `mainnet` e recusa na tela qualquer endereço `tb1.../m.../n...` ou invoice `lntb...`, com a mensagem de endereço inválido. O padrão é mainnet de propósito: é melhor uma POC recusar endereços até você configurar a rede do que um ATM de produção aceitar dinheiro rumo a um endereço de teste.
 - **Lightning Address na testnet:** endereços `usuario@dominio.com` resolvem para uma invoice na rede do provedor. A maioria dos provedores (Wallet of Satoshi etc.) é mainnet; para testar o fluxo de endereço em testnet, use um provedor LNURL-pay testnet ou teste o caminho de invoice BOLT11 (`lntb...`) diretamente.
 
 ### 3. Impressora física via USB
@@ -444,6 +450,7 @@ python src/main.py
 - As transações offline ficam em `/var/atm/offline_queue.json`
 - Elas são processadas automaticamente em segundo plano na inicialização e reprocessadas a cada 5 minutos enquanto o ATM roda (quando há internet)
 - Cada transação é removida da fila **antes** da tentativa de envio (garantia de no-máximo-uma-vez): em caso de crash/queda de energia durante o envio, o pagamento **não** é retransmitido — confira os logs para reconciliar
+- Depois de 10 tentativas de envio recusadas (por exemplo, um endereço que o BTCPay rejeita), a transação sai da fila e vai para `/var/atm/failed_queue.json`, com o motivo, e um alerta `CRITICAL` aparece no log. **Isso exige ação sua**: reembolsar o cliente ou corrigir o destino e reprocessar
 - Para processar manualmente:
   ```bash
   source venv/bin/activate

@@ -36,16 +36,42 @@ O padrão usado é `_Worker(_WorkerSignals)` com sinais `result`, `error` e `fin
 
 | Exceção | Significado | Ação |
 |---|---|---|
-| `PaymentNotBroadcast` | Certamente NÃO foi transmitido (sem conexão, 4xx) | Seguro enfileirar |
+| `PaymentNotBroadcast` | Certamente NÃO foi transmitido (sem conexão, 4xx, erro de preparação) | Seguro enfileirar |
 | `PaymentUncertain` | Resultado ambíguo (timeout, 5xx) | **Não reenfileirar** — operador confere manualmente |
 
 Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviado, a transação é descartada da fila com um log de erro e o operador deve verificar a carteira no BTCPay Server.
 
+Tudo que roda antes do POST — ler o `config.ini`, ler `/etc/atm/key`, descriptografar o token, resolver um Lightning Address — está envolvido por `_not_broadcast_on_error`, que converte qualquer exceção inesperada em `PaymentNotBroadcast`. Sem isso, um erro de configuração (chave ausente ou rotacionada) escapava como `FileNotFoundError`/`InvalidToken`, era tratado como ambíguo e a transação do cliente não era nem enviada nem preservada. Exceções já classificadas passam intactas, para que um `PaymentUncertain` nunca seja rebaixado.
+
+### Validação do destino
+
+O endereço on-chain e a invoice BOLT11 são validados por checksum (Base58Check,
+Bech32/Bech32m) **e contra a rede configurada** em `[btcpay] network`. Sem essa
+amarração, um ATM de mainnet aceitava um `tb1...` escaneado por engano: o
+cliente já tinha posto o dinheiro na máquina e o erro só aparecia quando o
+BTCPay recusasse o envio.
+
+A rede é lida uma vez, na inicialização da janela — a validação roda a cada
+caractere digitado ou lido do QR e não pode reabrir o `config.ini` a cada um.
+Valor ausente ou desconhecido cai em `mainnet`, e uma rede desconhecida recusa
+todos os endereços (falha fechada). Testnet e regtest compartilham os mesmos
+version bytes Base58, então só os endereços SegWit (`tb1` vs `bcrt1`)
+distinguem essas duas.
+
 ### Aceitação de cédulas
 
 - **Whitelist de denominações**: só valores reais de cédulas BRL (2, 5, 10, 20,
-  50, 100, 200) são creditados; ruído elétrico ou frames concatenados no buffer
-  serial são descartados com log (`atm_gui._parse_note`).
+  50, 100, 200) são creditados (`atm_gui._parse_notes`).
+- **Enquadramento** (`NOTE_FRAME_BYTES`): o fluxo serial é lido em quadros de 2
+  bytes, um por cédula. Duas notas na mesma janela de leitura são creditadas
+  separadamente; um quadro partido entre duas leituras tem o resto guardado
+  para a leitura seguinte, em vez de ser descartado — descartar engolia a
+  cédula, que já estava dentro da máquina. Um par que não bate com nenhuma
+  denominação faz o fluxo avançar 1 byte e tentar de novo (ressincronização),
+  o que impede um byte de ruído de desalinhar todas as cédulas seguintes.
+  Ressincronizar não pode inventar uma nota: toda denominação válida tem byte
+  alto `0x00`, posição que numa leitura deslocada é sempre ocupada pelo byte
+  baixo do quadro anterior.
 - **Acúmulo**: múltiplas cédulas somam ao total (`atm_gui._credit_note`), até o
   momento de confirmar o pagamento — inclusive depois de escolher o método.
 - **Teto por transação** (`max_transaction_brl`): atingido o teto, novas cédulas
@@ -54,6 +80,10 @@ Essa distinção evita gasto duplo: se há dúvida sobre se o Bitcoin foi enviad
   máximo uma cédula, pois a nota já está dentro da máquina quando o valor é
   lido — a inibição do noteiro por hardware é o complemento recomendado em
   produção.
+- **Cédula durante o envio**: o buffer serial continua sendo drenado enquanto o
+  pagamento roda (senão os bytes seriam creditados como "nota fantasma" logo
+  após o reset), mas o valor lido é registrado em nível crítico para reembolso
+  manual, em vez de sumir sem rastro.
 
 ### Precisão decimal
 
@@ -152,6 +182,29 @@ Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/off
 
 `is_online()` verifica conectividade fazendo `HEAD` no host do BTCPay configurado — não usa servidores externos (compatível com ambientes Tor).
 
+### Limite de tentativas e fila de descarte
+
+Cada transação carrega um contador `attempts`, incrementado só quando houve
+tentativa real de envio que falhou com `PaymentNotBroadcast`. Ao atingir
+`_MAX_QUEUE_ATTEMPTS` (10), ela sai da fila principal e vai para
+`/var/atm/failed_queue.json`, com `failed_at` e `last_error`, acompanhada de um
+log `CRITICAL`.
+
+Sem esse teto, uma transação que falha de forma determinística — o caso típico
+é um endereço que o BTCPay rejeita com 4xx — voltava para a fila a cada ciclo
+de 5 minutos, indefinidamente: o servidor era martelado, ninguém era avisado e
+o cliente nunca era reembolsado.
+
+O contador não é queimado por indisponibilidade: com o BTCPay fora do ar,
+`is_online()` impede o processamento, e sem cotação a transação é reenfileirada
+sem tentativa de envio. Só rejeições com o servidor no ar consomem tentativas —
+o teto equivale a ~50 minutos delas.
+
+A fila de descarte **não é lixo**: é dinheiro parado esperando uma pessoa. O
+operador reembolsa o cliente ou corrige o destino e reprocessa manualmente
+(mover a entrada de volta para `offline_queue.json`, sem os campos `attempts`,
+`failed_at` e `last_error`).
+
 ---
 
 ## Configuração (`config.ini`)
@@ -163,6 +216,7 @@ Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/off
 | `store_id` | `btcpay` | ID da loja no BTCPay |
 | `api_token` | `btcpay` | Token Fernet-criptografado |
 | `currency` | `btcpay` | Moeda fiduciária (ex.: `BRL`) |
+| `network` | `btcpay` | `mainnet` (padrão), `testnet` (cobre signet) ou `regtest`. Define quais endereços/invoices a GUI aceita |
 | `crypto_code` | `btcpay` | Código da cripto (ex.: `BTC`) |
 | `onchain_payment_method` | `btcpay` | (Opcional) Sobrescreve `BTC-CHAIN` |
 | `serial_port` | `hardware` | Porta serial do noteiro (ex.: `/dev/ttyUSB0`) |
@@ -181,3 +235,25 @@ tail -f /var/log/btc_atm.log
 # ou, se rodando como serviço systemd:
 sudo journalctl -u bitcoin-atm -f
 ```
+
+### Nível CRÍTICO = dinheiro parado esperando uma pessoa
+
+Todo registro `CRITICAL` significa que um cliente pode ter ficado sem o que
+pagou, e nenhum deles se resolve sozinho. São só cinco situações, todas com
+valor e destino na própria mensagem, porque a caixa de diálogo na tela some no
+cliente seguinte:
+
+```
+CRITICAL Nota de R$50 recusada: teto de R$1000 por transação já atingido ...
+CRITICAL Nota de R$50 inserida durante o envio e NÃO creditada. REEMBOLSO ...
+CRITICAL Pagamento com resultado INCERTO: R$150 para bc1q... (onchain). Confira
+         a carteira no BTCPay ANTES de reenviar (risco de gasto duplo). ...
+CRITICAL TRANSAÇÃO PERDIDA: R$150 para bc1q... (onchain) não foi enviada nem
+         enfileirada. Envio: ... | Enfileiramento: ...
+CRITICAL TRANSAÇÃO DESISTIDA após 10 tentativas: R$150 para bc1q... (onchain).
+         Movida para /var/atm/failed_queue.json. AÇÃO MANUAL NECESSÁRIA ...
+```
+
+Vale a pena alertar sobre esse nível (por exemplo, `journalctl -p crit`).
+Desfechos normais — inclusive uma transação enfileirada por falta de conexão —
+ficam em `INFO`, para que um `CRITICAL` nunca vire ruído ignorável.

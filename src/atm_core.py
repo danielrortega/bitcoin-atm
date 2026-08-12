@@ -1,4 +1,5 @@
 import configparser
+import contextlib
 import ipaddress
 import json
 import logging
@@ -15,7 +16,8 @@ import telegram_send
 from cryptography.fernet import Fernet
 from escpos.printer import Usb
 
-from btc_address import decode_bolt11_amount_msats, validate_lightning_address
+from btc_address import (DEFAULT_NETWORK, NETWORKS, decode_bolt11_amount_msats,
+                         validate_lightning_address)
 
 _LOG_PATH = '/var/log/btc_atm.log'
 _LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
@@ -27,6 +29,7 @@ except (PermissionError, FileNotFoundError, OSError):
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
 _QUEUE_PATH = '/var/atm/offline_queue.json'
+_FAILED_QUEUE_PATH = '/var/atm/failed_queue.json'
 _KEY_PATH = '/etc/atm/key'
 
 _SATOSHI = Decimal('0.00000001')
@@ -43,6 +46,18 @@ _QUEUE_LOCK = threading.RLock()
 # busca-se uma cotação fresca ao liquidar, para não usar um preço obsoleto.
 _QUEUE_RATE_MAX_AGE = 120
 
+# Quantas tentativas de ENVIO uma transação enfileirada faz antes de ir para a
+# fila de descarte. Sem este teto, uma transação que falha de forma
+# determinística (endereço que o BTCPay rejeita com 4xx) voltava para a fila a
+# cada ciclo, para sempre: ninguém era avisado e o cliente nunca era
+# reembolsado.
+#
+# Só conta tentativa de fato feita. Uma queda do BTCPay não queima o contador:
+# is_online() barra o processamento quando o host não responde, e a falta de
+# cotação reenfileira sem tentar enviar. Com o ciclo de 5 min, o teto equivale
+# a ~50 minutos de rejeições seguidas com o servidor no ar.
+_MAX_QUEUE_ATTEMPTS = 10
+
 
 class PaymentNotBroadcast(Exception):
     """O pagamento com certeza NÃO foi transmitido (sem conexão, ou rejeitado
@@ -53,6 +68,31 @@ class PaymentUncertain(Exception):
     """Resultado ambíguo (timeout, 5xx): o Bitcoin PODE já ter sido enviado.
     NÃO reenfileirar automaticamente — o operador deve conferir a carteira
     antes de qualquer reenvio, para evitar gasto duplo."""
+
+
+@contextlib.contextmanager
+def _not_broadcast_on_error(context):
+    """Classifica como PaymentNotBroadcast qualquer falha ocorrida ANTES do
+    POST de pagamento.
+
+    Ler o config.ini, ler /etc/atm/key e descriptografar o token acontecem
+    antes de qualquer byte ir para a rede. Se falharem, o Bitcoin com certeza
+    não saiu e a transação pode ser enfileirada com segurança.
+
+    Sem isto, uma chave ausente ou rotacionada escapava como
+    FileNotFoundError/InvalidToken — e tanto a GUI quanto a fila tratam
+    exceção desconhecida como resultado AMBÍGUO, que por segurança não é
+    reenfileirado. O cliente pagava em dinheiro e ficava sem o Bitcoin e sem
+    registro, por um erro de configuração que nem chegou a tentar pagar.
+
+    Exceções já classificadas passam intactas: rebaixar um PaymentUncertain
+    para PaymentNotBroadcast reintroduziria o risco de gasto duplo."""
+    try:
+        yield
+    except (PaymentNotBroadcast, PaymentUncertain):
+        raise
+    except Exception as e:
+        raise PaymentNotBroadcast(f"{context}: {e}") from e
 
 
 def brl_to_btc(amount_brl, rate):
@@ -66,8 +106,12 @@ def _post_payment(url, payload):
     """POST de pagamento com classificação do resultado para segurança
     financeira. Levanta PaymentNotBroadcast (seguro reenfileirar) ou
     PaymentUncertain (não reenfileirar) conforme o tipo de falha."""
+    # Montar o header lê a config e descriptografa o token — ainda antes da
+    # rede, portanto uma falha aqui é comprovadamente não-transmitida.
+    with _not_broadcast_on_error("falha ao montar as credenciais do BTCPay"):
+        headers = _btcpay_headers()
     try:
-        resp = requests.post(url, headers=_btcpay_headers(), json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
     except requests.ConnectionError as e:
         raise PaymentNotBroadcast(f"sem conexão: {e}") from e
     except requests.Timeout as e:
@@ -119,6 +163,25 @@ def get_max_transaction_brl():
     return _DEFAULT_MAX_TX_BRL
 
 
+def get_network():
+    """Rede Bitcoin em que este ATM opera ([btcpay] network no config.ini):
+    'mainnet', 'testnet' (cobre signet) ou 'regtest'.
+
+    Define quais endereços e invoices a GUI aceita. Config ausente ou valor
+    desconhecido caem em mainnet — recusar um endereço de teste é o lado
+    seguro para errar; o contrário aceitaria dinheiro de verdade rumo a um
+    destino que o BTCPay vai rejeitar."""
+    try:
+        value = _load_config()['btcpay']['network'].strip().lower()
+        if value in NETWORKS:
+            return value
+        logging.warning("network inválida (%s); usando %s. Válidas: %s",
+                        value, DEFAULT_NETWORK, ', '.join(NETWORKS))
+    except Exception:
+        logging.info("network não configurada; usando %s", DEFAULT_NETWORK)
+    return DEFAULT_NETWORK
+
+
 def _get_api_token():
     cfg = _load_config()
     encrypted = cfg['btcpay']['api_token']
@@ -164,24 +227,25 @@ def get_btc_rate():
 
 
 def send_onchain_payment(amount_brl, address, rate):
-    cfg = _load_config()
-    host = cfg['btcpay']['host'].rstrip('/')
-    store_id = cfg['btcpay']['store_id']
-    crypto = cfg['btcpay'].get('crypto_code', 'BTC')
-    # Path correto do Greenfield atual: payment-methods/{BTC-CHAIN}/wallet/...
-    # (o antigo /on-chain/{cryptoCode}/transactions retorna 404). Permite
-    # sobrescrever via config para instâncias mais antigas.
-    pm = cfg['btcpay'].get('onchain_payment_method', f'{crypto}-CHAIN')
-    amount_btc = brl_to_btc(amount_brl, rate)
-    url = f"{host}/api/v1/stores/{store_id}/payment-methods/{pm}/wallet/transactions"
-    payload = {
-        'destinations': [
-            {'destination': address, 'amount': str(amount_btc), 'subtractFromAmount': False}
-        ],
-        'noChange': False,
-        # 'feerate' é omitido de propósito: enviar null pode causar 422.
-        # Ausência → estimativa automática de taxa pelo BTCPay.
-    }
+    with _not_broadcast_on_error("falha ao preparar o pagamento on-chain"):
+        cfg = _load_config()
+        host = cfg['btcpay']['host'].rstrip('/')
+        store_id = cfg['btcpay']['store_id']
+        crypto = cfg['btcpay'].get('crypto_code', 'BTC')
+        # Path correto do Greenfield atual: payment-methods/{BTC-CHAIN}/wallet/...
+        # (o antigo /on-chain/{cryptoCode}/transactions retorna 404). Permite
+        # sobrescrever via config para instâncias mais antigas.
+        pm = cfg['btcpay'].get('onchain_payment_method', f'{crypto}-CHAIN')
+        amount_btc = brl_to_btc(amount_brl, rate)
+        url = f"{host}/api/v1/stores/{store_id}/payment-methods/{pm}/wallet/transactions"
+        payload = {
+            'destinations': [
+                {'destination': address, 'amount': str(amount_btc), 'subtractFromAmount': False}
+            ],
+            'noChange': False,
+            # 'feerate' é omitido de propósito: enviar null pode causar 422.
+            # Ausência → estimativa automática de taxa pelo BTCPay.
+        }
     resp = _post_payment(url, payload)
     # 2xx = transmitido. Daqui em diante o parsing nunca pode levantar.
     txid = _safe_json_field(resp, 'transactionHash')
@@ -307,19 +371,20 @@ def _lnurl_get_json(url, context):
 
 
 def send_lightning_payment(amount_brl, destination, rate):
-    cfg = _load_config()
-    host = cfg['btcpay']['host'].rstrip('/')
-    store_id = cfg['btcpay']['store_id']
-    crypto = cfg['btcpay'].get('crypto_code', 'BTC')
-    amount_btc = brl_to_btc(amount_brl, rate)
-    # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
-    # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
-    if validate_lightning_address(destination):
-        invoice = _resolve_lightning_address(destination, amount_btc)
-    else:
-        invoice = destination
-    url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
-    payload = {'BOLT11': invoice}
+    with _not_broadcast_on_error("falha ao preparar o pagamento Lightning"):
+        cfg = _load_config()
+        host = cfg['btcpay']['host'].rstrip('/')
+        store_id = cfg['btcpay']['store_id']
+        crypto = cfg['btcpay'].get('crypto_code', 'BTC')
+        amount_btc = brl_to_btc(amount_brl, rate)
+        # Lightning Address (user@domain) é resolvido para uma invoice BOLT11 com
+        # o valor exato; uma invoice BOLT11 já pronta é usada diretamente.
+        if validate_lightning_address(destination):
+            invoice = _resolve_lightning_address(destination, amount_btc)
+        else:
+            invoice = destination
+        url = f"{host}/api/v1/stores/{store_id}/lightning/{crypto}/invoices/pay"
+        payload = {'BOLT11': invoice}
     resp = _post_payment(url, payload)
     # 200 = Complete, 202 = Pending. Lê o status sem deixar o parsing levantar.
     data = {}
@@ -425,9 +490,16 @@ def process_offline_queue():
             print_receipt(tx['amount_brl'], amount_btc, tx['destination'], txid)
             logging.info("Offline queue tx processed: %s", txid)
         except PaymentNotBroadcast as e:
-            # Comprovadamente não transmitido → seguro recolocar na fila.
-            logging.warning("Queued tx not broadcast, re-queued: %s", e)
-            _requeue(tx)
+            # Comprovadamente não transmitido → seguro recolocar na fila, até
+            # o teto de tentativas.
+            tx['attempts'] = tx.get('attempts', 0) + 1
+            if tx['attempts'] >= _MAX_QUEUE_ATTEMPTS:
+                _dead_letter(tx, e)
+            else:
+                logging.warning("Queued tx not broadcast (tentativa %s/%s), "
+                                "re-queued: %s", tx['attempts'],
+                                _MAX_QUEUE_ATTEMPTS, e)
+                _requeue(tx)
         except PaymentUncertain as e:
             # Ambíguo (já removida da fila): NÃO reenfileira, para não arriscar
             # gasto duplo. Operador confere a carteira.
@@ -445,27 +517,52 @@ def _requeue(tx):
         _save_queue(queue)
 
 
-def _load_queue():
-    if not os.path.exists(_QUEUE_PATH):
+def _dead_letter(tx, error):
+    """Tira da fila principal uma transação que esgotou as tentativas e a
+    guarda em _FAILED_QUEUE_PATH.
+
+    Não é descarte: é dinheiro parado esperando uma pessoa. A transação sai do
+    laço de retry (que ficaria martelando o BTCPay indefinidamente) mas o
+    registro é preservado com o motivo, para o operador reembolsar o cliente
+    ou corrigir o destino e reprocessar manualmente."""
+    tx['failed_at'] = time.time()
+    tx['last_error'] = str(error)
+    with _QUEUE_LOCK:
+        failed = _load_queue(_FAILED_QUEUE_PATH)
+        failed.append(tx)
+        _save_queue(failed, _FAILED_QUEUE_PATH)
+    logging.critical(
+        "TRANSAÇÃO DESISTIDA após %s tentativas: R$%s para %s (%s). Movida "
+        "para %s. AÇÃO MANUAL NECESSÁRIA (reembolso ou reenvio). Último erro: %s",
+        tx['attempts'], tx.get('amount_brl'), tx.get('destination'),
+        tx.get('payment_type'), _FAILED_QUEUE_PATH, error)
+
+
+def _load_queue(path=None):
+    # O caminho é lido em tempo de chamada (e não como default do parâmetro)
+    # para que continue valendo se o módulo for reconfigurado.
+    path = path or _QUEUE_PATH
+    if not os.path.exists(path):
         return []
     try:
-        with open(_QUEUE_PATH, 'r') as f:
+        with open(path, 'r') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return []
 
 
-def _save_queue(queue):
+def _save_queue(queue, path=None):
     """Grava a fila de forma atômica (arquivo temporário + os.replace). Uma
     queda de energia no meio da escrita não pode corromper o JSON e fazer
     _load_queue descartar TODAS as pendências silenciosamente."""
-    os.makedirs(os.path.dirname(_QUEUE_PATH), exist_ok=True)
-    tmp = f"{_QUEUE_PATH}.tmp"
+    path = path or _QUEUE_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
     with open(tmp, 'w') as f:
         json.dump(queue, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, _QUEUE_PATH)
+    os.replace(tmp, path)
 
 
 def _send_telegram(amount_brl, amount_btc, destination, txid, payment_type):
