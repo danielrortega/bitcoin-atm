@@ -36,10 +36,15 @@ def _btcpay_host():
 
 def is_online(timeout=5):
     """Verifica a conectividade tentando alcançar o host do BTCPay configurado.
-    É mais relevante que um ping genérico (o que importa é se o BTCPay está
-    acessível) e evita vazar tráfego a terceiros (ex.: google.com) num
-    cenário com Tor. Qualquer resposta HTTP conta como online; só erros de
-    conexão/timeout contam como offline. Sem host configurado, retorna False."""
+
+    Consultar o próprio BTCPay é mais relevante que um ping genérico — o que
+    importa é se o servidor que recebe os pagamentos está acessível, não se a
+    internet está de pé. E não expõe a terceiros (ex.: google.com) o padrão de
+    operação do caixa: quando liga, quando fica offline, com que frequência
+    tenta reconectar.
+
+    Qualquer resposta HTTP conta como online; só erros de conexão/timeout
+    contam como offline. Sem host configurado, retorna False."""
     host = _btcpay_host()
     if not host:
         return False

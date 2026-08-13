@@ -186,7 +186,7 @@ Status `200` = completo, `202` = pendente (ambos tratados como enviado), `Failed
 
 Transações que falharam com `PaymentNotBroadcast` são salvas em `/var/atm/offline_queue.json`. Na próxima inicialização, se `is_online()` retornar `True`, `process_offline_queue()` é executado em background (via `QThreadPool`) sem bloquear a GUI.
 
-`is_online()` verifica conectividade fazendo `HEAD` no host do BTCPay configurado — não usa servidores externos (compatível com ambientes Tor).
+`is_online()` verifica conectividade fazendo `HEAD` no host do BTCPay configurado, e não em um servidor externo: o que importa é se o servidor que recebe os pagamentos está acessível, e assim o padrão de operação do caixa (quando liga, quando cai, com que frequência tenta reconectar) não é exposto a terceiros.
 
 ### Limite de tentativas e fila de descarte
 
