@@ -2,15 +2,18 @@ PyQt5==5.15.11
 cryptography==50.0.0
 pyserial==3.5
 requests==2.34.2
-# Nenhum código do ATM importa qrcode nem PIL diretamente (o leitor de QR é um
-# teclado USB, não há geração de imagem). Os dois pins são deliberados e devem
-# ficar: qrcode é dependência transitiva do python-escpos, e pillow foi fixado
-# nesta versão para fechar vulnerabilidades conhecidas. Remover as linhas não
-# desinstala nada — só troca versões auditadas por indeterminadas.
+# Nenhum código do ATM importa qrcode nem PIL (o leitor de QR é um teclado USB
+# e não há geração de imagem). Os dois pins têm motivos diferentes:
+#
+# qrcode é dependência transitiva do python-escpos — apagar a linha não
+# desinstala nada, só troca uma versão auditada por indeterminada.
+#
+# pillow não é puxado por ninguém hoje: era usado pelo utils.generate_qr_code,
+# removido por falta de uso. Fica porque o python-escpos precisa dele para
+# imprimir imagens (o recibo atual é só texto) e porque esta versão foi fixada
+# para fechar vulnerabilidades conhecidas. Se a impressão de imagem não estiver
+# no plano, é candidato a sair.
 qrcode==8.2
 pillow==12.3.0
 python-escpos==3.1
 telegram-send==0.39.2
-# Habilita proxies socks5:// no requests (ALL_PROXY), usado para alcançar
-# destinos .onion via Tor. Veja a seção do systemd no README.
-pysocks==1.7.1
