@@ -2,17 +2,21 @@ PyQt5==5.15.11
 cryptography==50.0.0
 pyserial==3.5
 requests==2.34.2
-# Nenhum código do ATM importa qrcode nem PIL (o leitor de QR é um teclado USB
-# e não há geração de imagem). Os dois pins têm motivos diferentes:
+# NÃO REMOVA estas duas linhas achando que são dependências sem uso. Nenhum
+# código do ATM importa qrcode ou PIL (o leitor de QR é um teclado USB e não há
+# geração de imagem), mas as duas são dependências DECLARADAS do python-escpos
+# (`Requires-Dist: Pillow (>=2.0)`, `qrcode (>=4.0)`), então o pip as instala de
+# qualquer maneira. Apagar as linhas não desinstala nada — só troca versões
+# auditadas por "qualquer uma que satisfaça", perdendo o piso de segurança que
+# o commit add8958 estabeleceu para fechar vulnerabilidades conhecidas.
 #
-# qrcode é dependência transitiva do python-escpos — apagar a linha não
-# desinstala nada, só troca uma versão auditada por indeterminada.
+# No caso do Pillow o risco é maior ainda: escpos/image.py faz
+# `from PIL import Image` no topo do módulo, e escpos/escpos.py o importa. Sem
+# Pillow, o `import escpos.printer` falha e o ATM não inicia.
 #
-# pillow não é puxado por ninguém hoje: era usado pelo utils.generate_qr_code,
-# removido por falta de uso. Fica porque o python-escpos precisa dele para
-# imprimir imagens (o recibo atual é só texto) e porque esta versão foi fixada
-# para fechar vulnerabilidades conhecidas. Se a impressão de imagem não estiver
-# no plano, é candidato a sair.
+# Verificação: `pip install --dry-run` NÃO serve para checar isso, porque só
+# lista o que seria instalado e omite o que já está presente no ambiente. Olhe
+# o `Requires-Dist` no METADATA do wheel.
 qrcode==8.2
 pillow==12.3.0
 python-escpos==3.1
